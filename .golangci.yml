@@ -1,0 +1,67 @@
+# https://golangci-lint.run/usage/configuration
+
+version: "2"
+
+linters:
+  # Enable all available linters.
+  default: all
+
+  # Disable specific linters.
+  disable:
+    - depguard
+    - err113
+    - noinlineerr
+    - tagalign
+    - varnamelen
+    - wsl
+
+  # Linter settings.
+  settings:
+    funcorder:
+      # Checks if the exported methods of a structure are placed before the non-exported ones.
+      struct-method: false
+    revive:
+      rules:
+        # Disable package level comments.
+        - name: package-comments
+          disabled: true
+        # Disable comments on public stuff.
+        - name: exported
+          disabled: true
+
+formatters:
+  # Enable specific formatters.
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+    - golines
+
+  # Formatter settings.
+  settings:
+    gci:
+      # Section configuration to compare against.
+      # Section names are case-insensitive and may contain parameters in ().
+      sections:
+        - standard
+        - default
+        - prefix(github.com/sknv/pqueue)
+
+    gofumpt:
+      # Module path which contains the source code being formatted.
+      module-path: github.com/sknv/pqueue
+
+    goimports:
+      # A list of prefixes, which, if set, checks import paths
+      # with the given prefixes are grouped after 3rd-party packages.
+      local-prefixes:
+        - github.com/sknv/pqueue
+
+    golines:
+      # Target maximum line length.
+      max-len: 120
+
+issues:
+  # Fix found issues (if it's supported by the linter).
+  fix: true

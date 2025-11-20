@@ -1,0 +1,24 @@
+# https://taskfile.dev/usage/
+
+version: "3"
+
+tasks:
+  ##
+  # Go section
+  ##
+
+  tools:
+    cmds:
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.2
+
+  deps:
+    cmds:
+      - go mod tidy && go mod vendor && go mod verify
+
+  test:
+    cmds:
+      - go test -v -failfast --tags=integration ./...
+
+  lint:
+    cmds:
+      - golangci-lint run
