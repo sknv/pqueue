@@ -1,5 +1,5 @@
 CREATE TYPE pqueue_job_status AS ENUM (
-    'pending', 'running', 'completed', 'failed'
+  'pending', 'running', 'completed', 'failed'
 );
 
 CREATE TABLE IF NOT EXISTS pqueue_jobs

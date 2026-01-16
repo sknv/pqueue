@@ -311,8 +311,7 @@ func (q *Queue) processJobs(ctx context.Context) int {
 		gr.Go(func() error {
 			job := &jobs[i]
 
-			jobErr := q.handleJob(ctx, job)
-			if jobErr != nil {
+			if jobErr := q.handleJob(ctx, job); jobErr != nil {
 				log.Printf("[PQueue][ERROR] Failed to handle job with id '%d': %v", job.ID, err)
 			}
 
@@ -401,8 +400,7 @@ func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 		return q.failJob(ctx, job, fmt.Errorf("no handler registered for job: %s", job.Queue))
 	}
 
-	err := handler.HandleJob(ctx, job)
-	if err != nil {
+	if err := handler.HandleJob(ctx, job); err != nil {
 		return q.handleJobError(ctx, handler, job, err)
 	}
 
