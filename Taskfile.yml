@@ -9,9 +9,9 @@ tasks:
 
   tools:
     cmds:
-      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.2
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0
 
-  deps:
+  vendor:
     cmds:
       - go mod tidy && go mod vendor && go mod verify
 
