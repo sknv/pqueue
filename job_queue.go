@@ -2,11 +2,13 @@ package pqueue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 )
@@ -203,6 +205,13 @@ func (q *Queue) RegisterHandler(jobType string, handler JobHandler) {
 	q.handlers[jobType] = handler
 }
 
+const _enqueueSQL = `
+	INSERT INTO pqueue_jobs (queue, payload, priority, max_attempts, stuck_timeout_millis, scheduled_at)
+	VALUES ($1, $2, $3, $4, $5, $6)
+	RETURNING id, queue, payload, status, priority, attempts, max_attempts, stuck_timeout_millis,
+	          scheduled_at, run_at, completed_at, error_message, created_at, updated_at
+`
+
 // Enqueue adds a new job to the queue.
 func (q *Queue) Enqueue(
 	ctx context.Context,
@@ -211,8 +220,11 @@ func (q *Queue) Enqueue(
 	payload any,
 	opts ...JobOption,
 ) (*Job, error) {
-	options := defaultJobOptions()
+	if queue == "" {
+		return nil, errors.New("queue name must not be empty")
+	}
 
+	options := defaultJobOptions()
 	for _, opt := range opts {
 		opt(options)
 	}
@@ -224,12 +236,16 @@ func (q *Queue) Enqueue(
 
 	var job Job
 
-	err = queryer.QueryRow(ctx, `
-		INSERT INTO pqueue_jobs (queue, payload, priority, max_attempts, stuck_timeout_millis, scheduled_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, queue, payload, status, priority, attempts, max_attempts, stuck_timeout_millis,
-		          scheduled_at, run_at, completed_at, error_message, created_at, updated_at
-	`, queue, payloadBytes, options.priority, options.maxAttempts, options.stuckTimeoutMillis(), options.scheduledAt).
+	err = queryer.QueryRow(
+		ctx,
+		_enqueueSQL,
+		queue,
+		payloadBytes,
+		options.priority,
+		options.maxAttempts,
+		options.stuckTimeoutMillis(),
+		options.scheduledAt,
+	).
 		Scan(
 			&job.ID, &job.Queue, &job.Payload, &job.Status, &job.Priority,
 			&job.Attempts, &job.MaxAttempts, &job.StuckTimeoutMillis, &job.ScheduledAt, &job.RunAt,
@@ -240,6 +256,103 @@ func (q *Queue) Enqueue(
 	}
 
 	return &job, nil
+}
+
+// BatchJob describes a single job to be enqueued as part of a batch.
+type BatchJob struct {
+	Queue   string
+	Payload any
+	Opts    []JobOption
+}
+
+// EnqueueBatch inserts all provided jobs in a single database round-trip.
+// It returns the persisted Job records in the same order as the input slice.
+// The call is atomic when sender is a pgx.Tx.
+//
+//nolint:funlen // linear logic
+func (q *Queue) EnqueueBatch(
+	ctx context.Context,
+	sender BatchSender,
+	jobs []BatchJob,
+) ([]*Job, error) {
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+
+	// Encode every payload up front so we don't partially send the batch on an encoding error
+	type preparedJob struct {
+		queue   string
+		payload []byte
+		options *jobOptions
+	}
+
+	prepared := make([]preparedJob, len(jobs))
+	for i, batchJob := range jobs {
+		if batchJob.Queue == "" {
+			return nil, fmt.Errorf("job at index %d: queue name must not be empty", i)
+		}
+
+		options := defaultJobOptions()
+		for _, opt := range batchJob.Opts {
+			opt(options)
+		}
+
+		payloadBytes, err := q.encoder.Encode(batchJob.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
+		}
+
+		prepared[i] = preparedJob{
+			queue:   batchJob.Queue,
+			payload: payloadBytes,
+			options: options,
+		}
+	}
+
+	// Build the pgx batch
+	var batch pgx.Batch
+
+	for _, p := range prepared {
+		batch.Queue(
+			_enqueueSQL,
+			p.queue,
+			p.payload,
+			p.options.priority,
+			p.options.maxAttempts,
+			p.options.stuckTimeoutMillis(),
+			p.options.scheduledAt,
+		)
+	}
+
+	batchResults := sender.SendBatch(ctx, &batch)
+
+	// Scan results in the same order the queries were queued
+	enqueued := make([]*Job, len(jobs))
+
+	for i := range prepared {
+		var job Job
+
+		err := batchResults.QueryRow().Scan(
+			&job.ID, &job.Queue, &job.Payload, &job.Status, &job.Priority,
+			&job.Attempts, &job.MaxAttempts, &job.StuckTimeoutMillis, &job.ScheduledAt, &job.RunAt,
+			&job.CompletedAt, &job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt,
+		)
+		if err != nil {
+			// Close drains remaining results before we return
+			_ = batchResults.Close()
+
+			return nil, fmt.Errorf("scan result for job at index %d (queue %q): %w", i, prepared[i].queue, err)
+		}
+
+		enqueued[i] = &job
+	}
+
+	// Close flushes any un-read results and returns any deferred server error
+	if err := batchResults.Close(); err != nil {
+		return nil, fmt.Errorf("close batch results: %w", err)
+	}
+
+	return enqueued, nil
 }
 
 // Start begins processing jobs.
