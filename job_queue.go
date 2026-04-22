@@ -129,6 +129,7 @@ type (
 
 	// QueueConfig holds configuration for the job queue.
 	QueueConfig struct {
+		DbTimeout   time.Duration // database timeout for background operations
 		Poll        PollConfig
 		ColdCleanup CleanupConfig
 		DeadCleanup CleanupConfig
@@ -139,6 +140,7 @@ type (
 func DefaultConfig() *QueueConfig {
 	//nolint:mnd // default values
 	return &QueueConfig{
+		DbTimeout: time.Second * 30,
 		Poll: PollConfig{
 			BatchSize:    10,
 			Concurrency:  10,
@@ -456,11 +458,7 @@ func (q *Queue) processJobs(ctx context.Context) int {
 
 // fetchJobs fetches batch of jobs from db.
 func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
-	const (
-		dbTimeout = time.Second * 30
-	)
-
-	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
 	defer cancel()
 
 	sql := `
@@ -535,11 +533,7 @@ func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 
 // completeJob marks a job as completed and moves it to a cold partition.
 func (q *Queue) completeJob(ctx context.Context, job *Job) error {
-	const (
-		dbTimeout = time.Second * 30
-	)
-
-	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
 	defer cancel()
 
 	cmd, err := q.db.Exec(ctx, `
@@ -574,11 +568,7 @@ func (q *Queue) handleJobError(
 		return q.failJob(ctx, job, err)
 	}
 
-	const (
-		dbTimeout = time.Second * 30
-	)
-
-	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
 	defer cancel()
 
 	errMsg := err.Error()
@@ -609,11 +599,7 @@ func (q *Queue) handleJobError(
 
 // failJob immediately fails a job moving it to the dead letter queue (partition with dead status).
 func (q *Queue) failJob(ctx context.Context, job *Job, err error) error {
-	const (
-		dbTimeout = time.Second * 30
-	)
-
-	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
 	defer cancel()
 
 	errMsg := err.Error()
@@ -646,13 +632,9 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 		return nil
 	}
 
-	const (
-		dbTimeout = time.Second * 30
-	)
-
 	log.Printf("[PQueue][INFO] Running cold jobs cleaner...")
 
-	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
 	defer cancel()
 
 	cutoffDate := time.Now().Add(-q.config.ColdCleanup.RetentionInterval)
@@ -691,13 +673,9 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 		return nil
 	}
 
-	const (
-		dbTimeout = time.Second * 30
-	)
-
 	log.Printf("[PQueue][INFO] Running dead jobs cleaner...")
 
-	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
 	defer cancel()
 
 	cutoffDate := time.Now().Add(-q.config.DeadCleanup.RetentionInterval)
