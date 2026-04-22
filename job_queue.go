@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -29,7 +30,7 @@ const (
 
 // Job represents a job in the queue.
 type Job struct {
-	ID                 int64
+	ID                 uuid.UUID
 	Queue              string
 	Payload            []byte
 	Status             JobStatus
@@ -206,8 +207,14 @@ func (q *Queue) RegisterHandler(jobType string, handler JobHandler) {
 }
 
 const _enqueueSQL = `
-	INSERT INTO pqueue_jobs (queue, payload, priority, max_attempts, stuck_timeout_millis, scheduled_at)
-	VALUES ($1, $2, $3, $4, $5, $6)
+	INSERT INTO pqueue_jobs (id, queue, payload, priority, max_attempts, stuck_timeout_millis, scheduled_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	ON CONFLICT (id) DO UPDATE SET
+	  priority = EXCLUDED.priority,
+	  max_attempts = EXCLUDED.max_attempts,
+	  stuck_timeout_millis = EXCLUDED.stuck_timeout_millis,
+	  scheduled_at = EXCLUDED.scheduled_at,
+	  updated_at = now()
 	RETURNING id, queue, payload, status, priority, attempts, max_attempts, stuck_timeout_millis,
 	          scheduled_at, run_at, completed_at, error_message, created_at, updated_at
 `
@@ -216,6 +223,7 @@ const _enqueueSQL = `
 func (q *Queue) Enqueue(
 	ctx context.Context,
 	queryer QueryRower,
+	id uuid.UUID,
 	queue string,
 	payload any,
 	opts ...JobOption,
@@ -239,6 +247,7 @@ func (q *Queue) Enqueue(
 	err = queryer.QueryRow(
 		ctx,
 		_enqueueSQL,
+		id,
 		queue,
 		payloadBytes,
 		options.priority,
@@ -260,6 +269,7 @@ func (q *Queue) Enqueue(
 
 // BatchJob describes a single job to be enqueued as part of a batch.
 type BatchJob struct {
+	ID      uuid.UUID
 	Queue   string
 	Payload any
 	Opts    []JobOption
@@ -281,6 +291,7 @@ func (q *Queue) EnqueueBatch(
 
 	// Encode every payload up front so we don't partially send the batch on an encoding error
 	type preparedJob struct {
+		id      uuid.UUID
 		queue   string
 		payload []byte
 		options *jobOptions
@@ -303,6 +314,7 @@ func (q *Queue) EnqueueBatch(
 		}
 
 		prepared[i] = preparedJob{
+			id:      batchJob.ID,
 			queue:   batchJob.Queue,
 			payload: payloadBytes,
 			options: options,
@@ -315,6 +327,7 @@ func (q *Queue) EnqueueBatch(
 	for _, p := range prepared {
 		batch.Queue(
 			_enqueueSQL,
+			p.id,
 			p.queue,
 			p.payload,
 			p.options.priority,
@@ -341,7 +354,7 @@ func (q *Queue) EnqueueBatch(
 			// Close drains remaining results before we return
 			_ = batchResults.Close()
 
-			return nil, fmt.Errorf("scan result for job at index %d (queue %q): %w", i, prepared[i].queue, err)
+			return nil, fmt.Errorf("scan result for job at index %d (queue '%s'): %w", i, prepared[i].queue, err)
 		}
 
 		enqueued[i] = &job
