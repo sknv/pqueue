@@ -3,7 +3,7 @@ CREATE TYPE pqueue_job_status AS ENUM (
 );
 
 CREATE TABLE IF NOT EXISTS pqueue_jobs (
-  id                   uuid              NOT NULL DEFAULT gen_random_uuid(), -- предпочтительно uuid v7
+  id                   uuid              NOT NULL DEFAULT uuidv7(),
   queue                text              NOT NULL,
   payload              bytea,
   status               pqueue_job_status NOT NULL DEFAULT 'pending',
