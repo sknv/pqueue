@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,12 +45,6 @@ type Job struct {
 	ErrorMessage       *string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
-}
-
-// JobHandler defines a job processor.
-type JobHandler interface {
-	HandleJob(ctx context.Context, job *Job) error
-	CalculateBackoff(attempt int) time.Duration
 }
 
 // JobOption is a function to configure job options.
@@ -105,10 +100,45 @@ func WithMaxAttempts(attempts int) JobOption {
 }
 
 //
+// Job handler
+//
+
+type (
+	// JobHandler defines a job processor.
+	JobHandler func(ctx context.Context, job *Job) error
+
+	// BackoffCalculator defines a function to calculate backoff for retries.
+	BackoffCalculator func(attempt int) time.Duration
+)
+
+// jobHandler defines inner job processor implementation.
+type jobHandler struct {
+	handler           JobHandler
+	backoffCalculator BackoffCalculator
+}
+
+func (h *jobHandler) calculateBackoff(attempt int, defaultBackoff time.Duration) time.Duration {
+	if h.backoffCalculator == nil {
+		return defaultBackoff
+	}
+
+	return h.backoffCalculator(attempt)
+}
+
+// JobHandlerOption is a function to configure job handler options.
+type JobHandlerOption func(*jobHandler)
+
+func WithBackoffCalculator(backoffCalculator BackoffCalculator) JobHandlerOption {
+	return func(h *jobHandler) {
+		h.backoffCalculator = backoffCalculator
+	}
+}
+
+//
 // Queue
 //
 
-// Encoder marshals and unmarshals job payload.
+// Encoder marshals job payload.
 type Encoder interface {
 	Encode(v any) ([]byte, error)
 }
@@ -121,16 +151,23 @@ type (
 		PollInterval time.Duration // sleep when no jobs claimed
 	}
 
+	// ProcessingConfig configures job processing,.
+	ProcessingConfig struct {
+		DbTimeout      time.Duration // database timeout for background operations
+		DefaultBackoff time.Duration // default job backoff
+	}
+
 	// CleanupConfig configures cold and dead partitions cleaning process.
 	CleanupConfig struct {
+		DbTimeout         time.Duration // database timeout for background operations
 		RetentionInterval time.Duration // time to keep jobs in partition
 		CleanupBatchSize  int           // how many records should we delete at once
 	}
 
 	// QueueConfig holds configuration for the job queue.
 	QueueConfig struct {
-		DbTimeout   time.Duration // database timeout for background operations
 		Poll        PollConfig
+		Processing  ProcessingConfig
 		ColdCleanup CleanupConfig
 		DeadCleanup CleanupConfig
 	}
@@ -140,17 +177,22 @@ type (
 func DefaultConfig() *QueueConfig {
 	//nolint:mnd // default values
 	return &QueueConfig{
-		DbTimeout: time.Second * 30,
 		Poll: PollConfig{
 			BatchSize:    10,
 			Concurrency:  10,
 			PollInterval: time.Second,
 		},
+		Processing: ProcessingConfig{
+			DbTimeout:      time.Second * 10,
+			DefaultBackoff: time.Second,
+		},
 		ColdCleanup: CleanupConfig{
+			DbTimeout:         time.Second * 30,
 			RetentionInterval: time.Hour * 24 * 7,
 			CleanupBatchSize:  10_000,
 		},
 		DeadCleanup: CleanupConfig{
+			DbTimeout:         time.Second * 30,
 			RetentionInterval: time.Hour * 24 * 90,
 			CleanupBatchSize:  10_000,
 		},
@@ -173,7 +215,7 @@ type Queue struct {
 	config  *QueueConfig
 	encoder Encoder
 
-	handlers map[string]JobHandler
+	handlers map[string]*jobHandler
 	wg       sync.WaitGroup
 }
 
@@ -192,7 +234,7 @@ func NewQueue(
 		config:  config,
 		encoder: &JsonEncoder{},
 
-		handlers: make(map[string]JobHandler),
+		handlers: make(map[string]*jobHandler),
 		wg:       sync.WaitGroup{},
 	}
 
@@ -204,14 +246,23 @@ func NewQueue(
 }
 
 // RegisterHandler registers a handler for a job type.
-func (q *Queue) RegisterHandler(jobType string, handler JobHandler) {
-	q.handlers[jobType] = handler
+func (q *Queue) RegisterHandler(jobType string, handler JobHandler, opts ...JobHandlerOption) {
+	handlerWrapper := &jobHandler{
+		handler:           handler,
+		backoffCalculator: nil,
+	}
+
+	for _, opt := range opts {
+		opt(handlerWrapper)
+	}
+
+	q.handlers[jobType] = handlerWrapper
 }
 
 const _enqueueSQL = `
 	INSERT INTO pqueue_jobs (id, queue, payload, priority, max_attempts, stuck_timeout_millis, scheduled_at)
 	VALUES ($1, $2, $3, $4, $5, $6, $7)
-	ON CONFLICT (id) DO UPDATE SET
+	ON CONFLICT (id, status) DO UPDATE SET
 	  priority = EXCLUDED.priority,
 	  max_attempts = EXCLUDED.max_attempts,
 	  stuck_timeout_millis = EXCLUDED.stuck_timeout_millis,
@@ -239,14 +290,20 @@ func (q *Queue) Enqueue(
 		opt(options)
 	}
 
-	payloadBytes, err := q.encoder.Encode(payload)
-	if err != nil {
-		return nil, fmt.Errorf("encode payload: %w", err)
+	var payloadBytes []byte
+
+	if payload != nil {
+		var err error
+
+		payloadBytes, err = q.encoder.Encode(payload)
+		if err != nil {
+			return nil, fmt.Errorf("encode payload: %w", err)
+		}
 	}
 
 	var job Job
 
-	err = queryer.QueryRow(
+	err := queryer.QueryRow(
 		ctx,
 		_enqueueSQL,
 		id,
@@ -277,11 +334,16 @@ type BatchJob struct {
 	Opts    []JobOption
 }
 
+type preparedJob struct {
+	id      uuid.UUID
+	queue   string
+	payload []byte
+	options *jobOptions
+}
+
 // EnqueueBatch inserts all provided jobs in a single database round-trip.
 // It returns the persisted Job records in the same order as the input slice.
 // The call is atomic when sender is a pgx.Tx.
-//
-//nolint:funlen // linear logic
 func (q *Queue) EnqueueBatch(
 	ctx context.Context,
 	sender BatchSender,
@@ -291,42 +353,16 @@ func (q *Queue) EnqueueBatch(
 		return nil, nil
 	}
 
-	// Encode every payload up front so we don't partially send the batch on an encoding error
-	type preparedJob struct {
-		id      uuid.UUID
-		queue   string
-		payload []byte
-		options *jobOptions
-	}
-
-	prepared := make([]preparedJob, len(jobs))
-	for i, batchJob := range jobs {
-		if batchJob.Queue == "" {
-			return nil, fmt.Errorf("job at index %d: queue name must not be empty", i)
-		}
-
-		options := defaultJobOptions()
-		for _, opt := range batchJob.Opts {
-			opt(options)
-		}
-
-		payloadBytes, err := q.encoder.Encode(batchJob.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
-		}
-
-		prepared[i] = preparedJob{
-			id:      batchJob.ID,
-			queue:   batchJob.Queue,
-			payload: payloadBytes,
-			options: options,
-		}
+	// Prepare batch of jobs first
+	preparedJobs, err := q.prepareBatchJobs(jobs)
+	if err != nil {
+		return nil, fmt.Errorf("prepare batch jobs: %w", err)
 	}
 
 	// Build the pgx batch
 	var batch pgx.Batch
 
-	for _, p := range prepared {
+	for _, p := range preparedJobs {
 		batch.Queue(
 			_enqueueSQL,
 			p.id,
@@ -344,10 +380,10 @@ func (q *Queue) EnqueueBatch(
 	// Scan results in the same order the queries were queued
 	enqueued := make([]*Job, len(jobs))
 
-	for i := range prepared {
+	for i := range preparedJobs {
 		var job Job
 
-		err := batchResults.QueryRow().Scan(
+		err = batchResults.QueryRow().Scan(
 			&job.ID, &job.Queue, &job.Payload, &job.Status, &job.Priority,
 			&job.Attempts, &job.MaxAttempts, &job.StuckTimeoutMillis, &job.ScheduledAt, &job.RunAt,
 			&job.CompletedAt, &job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt,
@@ -356,18 +392,54 @@ func (q *Queue) EnqueueBatch(
 			// Close drains remaining results before we return
 			_ = batchResults.Close()
 
-			return nil, fmt.Errorf("scan result for job at index %d (queue '%s'): %w", i, prepared[i].queue, err)
+			return nil, fmt.Errorf("scan result for job at index %d (queue '%s'): %w", i, preparedJobs[i].queue, err)
 		}
 
 		enqueued[i] = &job
 	}
 
 	// Close flushes any un-read results and returns any deferred server error
-	if err := batchResults.Close(); err != nil {
+	if err = batchResults.Close(); err != nil {
 		return nil, fmt.Errorf("close batch results: %w", err)
 	}
 
 	return enqueued, nil
+}
+
+// prepareBatchJobs encodes every payload and applies options up front
+// so we don't partially send the batch on an encoding error.
+func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]preparedJob, error) {
+	prepared := make([]preparedJob, len(jobs))
+	for i, batchJob := range jobs {
+		if batchJob.Queue == "" {
+			return nil, fmt.Errorf("job at index %d: queue name must not be empty", i)
+		}
+
+		options := defaultJobOptions()
+		for _, opt := range batchJob.Opts {
+			opt(options)
+		}
+
+		var payloadBytes []byte
+
+		if batchJob.Payload != nil {
+			var err error
+
+			payloadBytes, err = q.encoder.Encode(batchJob.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
+			}
+		}
+
+		prepared[i] = preparedJob{
+			id:      batchJob.ID,
+			queue:   batchJob.Queue,
+			payload: payloadBytes,
+			options: options,
+		}
+	}
+
+	return prepared, nil
 }
 
 // Start begins processing jobs.
@@ -417,7 +489,7 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 	}
 }
 
-// handlerJobs fetches batch of jobs from db and routes them to handlers. Returns a total count of fetched jobs.
+// handlerJobs fetches batch of jobs from db and routes them to handlers. Returns a total count of processed jobs.
 func (q *Queue) processJobs(ctx context.Context) int {
 	// Fetch jobs from db first
 	jobs, err := q.fetchJobs(ctx)
@@ -435,12 +507,19 @@ func (q *Queue) processJobs(ctx context.Context) int {
 	gr := errgroup.Group{}
 	gr.SetLimit(q.config.Poll.Concurrency)
 
+	var successCount int64 // atomic counter for successful jobs
+
 	for i := range jobs {
 		gr.Go(func() error {
 			job := &jobs[i]
 
 			if jobErr := q.handleJob(ctx, job); jobErr != nil {
-				log.Printf("[PQueue][ERROR] Failed to handle job with id '%d': %v", job.ID, err)
+				log.Printf("[PQueue][ERROR] Failed to handle job with id '%s': %v", job.ID, jobErr)
+			} else {
+				// Job completed, failed, or rescheduled – as long as no error was returned
+				// from handleJob (i.e., the job was handled without a fatal processing error),
+				// we count it as successfully processed.
+				atomic.AddInt64(&successCount, 1)
 			}
 
 			return nil
@@ -453,12 +532,12 @@ func (q *Queue) processJobs(ctx context.Context) int {
 		return 0
 	}
 
-	return len(jobs)
+	return int(successCount)
 }
 
 // fetchJobs fetches batch of jobs from db.
 func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
-	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
 	sql := `
@@ -524,7 +603,7 @@ func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 		return q.failJob(ctx, job, fmt.Errorf("no handler registered for job: %s", job.Queue))
 	}
 
-	if err := handler.HandleJob(ctx, job); err != nil {
+	if err := handler.handler(ctx, job); err != nil {
 		return q.handleJobError(ctx, handler, job, err)
 	}
 
@@ -533,7 +612,7 @@ func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 
 // completeJob marks a job as completed and moves it to a cold partition.
 func (q *Queue) completeJob(ctx context.Context, job *Job) error {
-	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
 	cmd, err := q.db.Exec(ctx, `
@@ -550,7 +629,7 @@ func (q *Queue) completeJob(ctx context.Context, job *Job) error {
 	}
 
 	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("job with id '%d' was not marked as completed", job.ID)
+		return fmt.Errorf("job with id '%s' was not marked as completed", job.ID)
 	}
 
 	return nil
@@ -559,7 +638,7 @@ func (q *Queue) completeJob(ctx context.Context, job *Job) error {
 // handleJobError handles job processing errors with backoff.
 func (q *Queue) handleJobError(
 	ctx context.Context,
-	jobHandler JobHandler,
+	jobHandler *jobHandler,
 	job *Job,
 	err error,
 ) error {
@@ -568,13 +647,13 @@ func (q *Queue) handleJobError(
 		return q.failJob(ctx, job, err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
 	errMsg := err.Error()
 
 	// Calculate backoff duration
-	backoff := jobHandler.CalculateBackoff(job.Attempts)
+	backoff := jobHandler.calculateBackoff(job.Attempts, q.config.Processing.DefaultBackoff)
 	nextSchedule := time.Now().Add(backoff)
 
 	// Update a job with new schedule
@@ -591,7 +670,7 @@ func (q *Queue) handleJobError(
 	}
 
 	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("job with id '%d' was not re-scheduled", job.ID)
+		return fmt.Errorf("job with id '%s' was not re-scheduled", job.ID)
 	}
 
 	return nil
@@ -599,7 +678,7 @@ func (q *Queue) handleJobError(
 
 // failJob immediately fails a job moving it to the dead letter queue (partition with dead status).
 func (q *Queue) failJob(ctx context.Context, job *Job, err error) error {
-	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
 	errMsg := err.Error()
@@ -617,7 +696,7 @@ func (q *Queue) failJob(ctx context.Context, job *Job, err error) error {
 	}
 
 	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("job with id '%d' was not marked as failed", job.ID)
+		return fmt.Errorf("job with id '%s' was not marked as failed", job.ID)
 	}
 
 	return nil
@@ -634,7 +713,7 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 
 	log.Printf("[PQueue][INFO] Running cold jobs cleaner...")
 
-	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.ColdCleanup.DbTimeout)
 	defer cancel()
 
 	cutoffDate := time.Now().Add(-q.config.ColdCleanup.RetentionInterval)
@@ -675,7 +754,7 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 
 	log.Printf("[PQueue][INFO] Running dead jobs cleaner...")
 
-	ctx, cancel := context.WithTimeout(ctx, q.config.DbTimeout)
+	ctx, cancel := context.WithTimeout(ctx, q.config.DeadCleanup.DbTimeout)
 	defer cancel()
 
 	cutoffDate := time.Now().Add(-q.config.DeadCleanup.RetentionInterval)
