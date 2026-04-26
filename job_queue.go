@@ -184,7 +184,7 @@ func DefaultConfig() *QueueConfig {
 		},
 		Processing: ProcessingConfig{
 			DbTimeout:      time.Second * 10,
-			DefaultBackoff: time.Second,
+			DefaultBackoff: time.Second * 10,
 		},
 		ColdCleanup: CleanupConfig{
 			DbTimeout:         time.Second * 30,
@@ -602,7 +602,12 @@ func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
 func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 	handler, exists := q.handlers[job.Queue]
 	if !exists {
-		return q.failJob(ctx, job, fmt.Errorf("no handler registered for job: %s", job.Queue))
+		log.Printf("[PQueue][ERROR] No handler registered for queue '%s', job '%s' will be rescheduled", job.Queue, job.ID)
+
+		// Use a blank handler so handleJobError falls back to the configured default backoff.
+		// The job will be retried until MaxAttempts is reached,
+		// at which point it moves to the dead-letter queue like any other failure.
+		return q.handleJobError(ctx, &jobHandler{}, job, fmt.Errorf("no handler registered for queue '%s'", job.Queue))
 	}
 
 	if err := handler.handler(ctx, job); err != nil {
