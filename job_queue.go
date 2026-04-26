@@ -239,14 +239,20 @@ func (q *Queue) Enqueue(
 		opt(options)
 	}
 
-	payloadBytes, err := q.encoder.Encode(payload)
-	if err != nil {
-		return nil, fmt.Errorf("encode payload: %w", err)
+	var payloadBytes []byte
+
+	if payload != nil {
+		var err error
+
+		payloadBytes, err = q.encoder.Encode(payload)
+		if err != nil {
+			return nil, fmt.Errorf("encode payload: %w", err)
+		}
 	}
 
 	var job Job
 
-	err = queryer.QueryRow(
+	err := queryer.QueryRow(
 		ctx,
 		_enqueueSQL,
 		id,
@@ -310,9 +316,15 @@ func (q *Queue) EnqueueBatch(
 			opt(options)
 		}
 
-		payloadBytes, err := q.encoder.Encode(batchJob.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
+		var payloadBytes []byte
+
+		if batchJob.Payload != nil {
+			var err error
+
+			payloadBytes, err = q.encoder.Encode(batchJob.Payload)
+			if err != nil {
+				return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
+			}
 		}
 
 		prepared[i] = preparedJob{
