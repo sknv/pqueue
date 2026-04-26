@@ -3,7 +3,7 @@ CREATE TYPE pqueue_job_status AS ENUM (
 );
 
 CREATE TABLE IF NOT EXISTS pqueue_jobs (
-  id                   uuid              NOT NULL DEFAULT uuidv7(),
+  id                   uuid              PRIMARY KEY DEFAULT uuidv7(),
   queue                text              NOT NULL,
   payload              bytea,
   status               pqueue_job_status NOT NULL DEFAULT 'pending',
@@ -13,13 +13,12 @@ CREATE TABLE IF NOT EXISTS pqueue_jobs (
   stuck_timeout_millis bigint            NOT NULL,
   scheduled_at         timestamptz       NOT NULL DEFAULT now(),
   run_at               timestamptz,
+  stuck_at             timestamptz,
   completed_at         timestamptz,
   error_message        text,
   created_at           timestamptz       NOT NULL DEFAULT now(),
-  updated_at           timestamptz       NOT NULL DEFAULT now(),
-
-  PRIMARY KEY (id, status)
-) PARTITION BY LIST (status);
+  updated_at           timestamptz       NOT NULL DEFAULT now()
+);
 
 COMMENT ON TABLE pqueue_jobs IS 'Очередь задач';
 COMMENT ON COLUMN pqueue_jobs.queue IS 'Имя очереди';
@@ -27,22 +26,45 @@ COMMENT ON COLUMN pqueue_jobs.payload IS 'Нагрузка для задачи';
 COMMENT ON COLUMN pqueue_jobs.priority IS 'Приоритет выполнения: чем больше, тем выше приоритет';
 COMMENT ON COLUMN pqueue_jobs.attempts IS 'Текущее число попыток запуска задачи';
 COMMENT ON COLUMN pqueue_jobs.max_attempts IS 'Максимальное число попыток запуска задачи';
-COMMENT ON COLUMN pqueue_jobs.stuck_timeout_millis IS 'Время в миллисекундах, после которого задача считается зависшей';
+COMMENT ON COLUMN pqueue_jobs.stuck_timeout_millis IS 'Промежуток времени в миллисекундах, после которого задача считается зависшей';
 COMMENT ON COLUMN pqueue_jobs.scheduled_at IS 'Время, в которое запланирован запуск задачи';
 COMMENT ON COLUMN pqueue_jobs.run_at IS 'Время, в которое задача была запущена';
+COMMENT ON COLUMN pqueue_jobs.stuck_at IS 'Время, после которого задача считается зависшей';
 COMMENT ON COLUMN pqueue_jobs.completed_at IS 'Время, в которое задача была завершена';
 COMMENT ON COLUMN pqueue_jobs.error_message IS 'Последнее сообщение об ошибке';
 
--- Создаем горячую, холодную и партицию для мертвых сообщений
-CREATE TABLE IF NOT EXISTS pqueue_jobs_hot PARTITION OF pqueue_jobs FOR VALUES IN ('pending', 'running');
-CREATE TABLE IF NOT EXISTS pqueue_jobs_cold PARTITION OF pqueue_jobs FOR VALUES IN ('completed');
-CREATE TABLE IF NOT EXISTS pqueue_jobs_dead PARTITION OF pqueue_jobs FOR VALUES IN ('failed');
+-- Триггер для автоматического обновления updated_at таймстемпа
+CREATE OR REPLACE FUNCTION pqueue_set_updated_at()
+RETURNS trigger AS $$
+BEGIN
+  IF NEW IS DISTINCT FROM OLD THEN
+    NEW.updated_at = now();
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
--- Индексы для горячей партиции
-CREATE INDEX IF NOT EXISTS idx__pqueue_jobs_hot__worker ON pqueue_jobs_hot (priority DESC, scheduled_at);
+CREATE TRIGGER trg__pqueue_jobs__updated_at
+BEFORE UPDATE ON pqueue_jobs
+FOR EACH ROW
+EXECUTE FUNCTION pqueue_set_updated_at();
 
--- Индексы для холодной партиции
-CREATE INDEX IF NOT EXISTS idx__pqueue_jobs_cold__cleaner ON pqueue_jobs_cold (created_at);
+-- Основной индекс для получения задач на выполнение
+CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__pending_worker
+ON pqueue_jobs (priority DESC, scheduled_at)
+WHERE status = 'pending';
 
--- Индексы для партиции c мертвыми сообщениями
-CREATE INDEX IF NOT EXISTS idx__pqueue_jobs_dead__cleaner ON pqueue_jobs_dead (created_at);
+-- Индекс для получения зависших задач
+CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__stuck_worker
+ON pqueue_jobs (stuck_at)
+WHERE status = 'running';
+
+-- Индекс для очистки завершенных задач
+CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__completed_cleaner
+ON pqueue_jobs (created_at)
+WHERE status = 'completed';
+
+-- Индекс для очистки мертвых задач
+CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__failed_cleaner
+ON pqueue_jobs (created_at)
+WHERE status = 'failed';
