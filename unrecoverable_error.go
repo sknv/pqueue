@@ -26,5 +26,7 @@ func Unrecoverable(err error) error {
 
 // IsUnrecoverable checks if error is an instance of unrecoverable error.
 func IsUnrecoverable(err error) bool {
-	return errors.As(err, &unrecoverableError{}) //nolint:exhaustruct // just a type check
+	_, ok := errors.AsType[unrecoverableError](err)
+
+	return ok
 }

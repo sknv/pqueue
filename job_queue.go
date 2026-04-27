@@ -35,9 +35,9 @@ type Job struct {
 	Payload            []byte
 	Status             JobStatus
 	Priority           int
-	Attempts           int
-	MaxAttempts        int
-	StuckTimeoutMillis int64
+	Attempts           uint
+	MaxAttempts        uint
+	StuckTimeoutMillis uint64
 	ScheduledAt        time.Time
 	RunAt              *time.Time
 	StuckAt            *time.Time
@@ -52,7 +52,7 @@ type JobOption func(*jobOptions)
 
 type jobOptions struct {
 	priority     int
-	maxAttempts  int
+	maxAttempts  uint
 	stuckTimeout time.Duration
 	scheduledAt  time.Time
 }
@@ -93,7 +93,7 @@ func WithStuckTimeout(t time.Duration) JobOption {
 }
 
 // WithMaxAttempts sets the maximum number of attempts.
-func WithMaxAttempts(attempts int) JobOption {
+func WithMaxAttempts(attempts uint) JobOption {
 	return func(o *jobOptions) {
 		o.maxAttempts = attempts
 	}
@@ -108,16 +108,16 @@ type (
 	JobHandler func(ctx context.Context, job *Job) error
 
 	// BackoffCalculator defines a function to calculate backoff for retries.
-	BackoffCalculator func(attempt int) time.Duration
+	BackoffCalculator func(attempt uint) time.Duration
 )
 
-// jobHandler defines inner job processor implementation.
-type jobHandler struct {
+// jobHandlerWrapper defines inner job processor implementation.
+type jobHandlerWrapper struct {
 	handler           JobHandler
 	backoffCalculator BackoffCalculator
 }
 
-func (h *jobHandler) calculateBackoff(attempt int, defaultBackoff time.Duration) time.Duration {
+func (h *jobHandlerWrapper) calculateBackoff(attempt uint, defaultBackoff time.Duration) time.Duration {
 	if h.backoffCalculator == nil {
 		return defaultBackoff
 	}
@@ -126,10 +126,10 @@ func (h *jobHandler) calculateBackoff(attempt int, defaultBackoff time.Duration)
 }
 
 // JobHandlerOption is a function to configure job handler options.
-type JobHandlerOption func(*jobHandler)
+type JobHandlerOption func(*jobHandlerWrapper)
 
 func WithBackoffCalculator(backoffCalculator BackoffCalculator) JobHandlerOption {
-	return func(h *jobHandler) {
+	return func(h *jobHandlerWrapper) {
 		h.backoffCalculator = backoffCalculator
 	}
 }
@@ -146,7 +146,7 @@ type Encoder interface {
 type (
 	// PollConfig configures the poller loop.
 	PollConfig struct {
-		BatchSize    int           // number of jobs to claim per poll
+		BatchSize    uint          // number of jobs to claim per poll
 		Concurrency  int           // max in-flight jobs
 		PollInterval time.Duration // sleep when no jobs claimed
 	}
@@ -161,7 +161,7 @@ type (
 	CleanupConfig struct {
 		DbTimeout         time.Duration // database timeout for background operations
 		RetentionInterval time.Duration // time to keep jobs in storage
-		CleanupBatchSize  int           // how many records should we delete at once
+		CleanupBatchSize  uint          // how many records should we delete at once
 	}
 
 	// QueueConfig holds configuration for the job queue.
@@ -184,7 +184,7 @@ func DefaultConfig() *QueueConfig {
 		},
 		Processing: ProcessingConfig{
 			DbTimeout:      time.Second * 10,
-			DefaultBackoff: time.Second * 10,
+			DefaultBackoff: time.Second * 30,
 		},
 		ColdCleanup: CleanupConfig{
 			DbTimeout:         time.Second * 30,
@@ -215,7 +215,7 @@ type Queue struct {
 	config  *QueueConfig
 	encoder Encoder
 
-	handlers map[string]*jobHandler
+	handlers map[string]*jobHandlerWrapper
 	wg       sync.WaitGroup
 }
 
@@ -234,7 +234,7 @@ func NewQueue(
 		config:  config,
 		encoder: &JsonEncoder{},
 
-		handlers: make(map[string]*jobHandler),
+		handlers: make(map[string]*jobHandlerWrapper),
 		wg:       sync.WaitGroup{},
 	}
 
@@ -247,7 +247,7 @@ func NewQueue(
 
 // RegisterHandler registers a handler for a job type.
 func (q *Queue) RegisterHandler(jobType string, handler JobHandler, opts ...JobHandlerOption) {
-	handlerWrapper := &jobHandler{
+	handlerWrapper := &jobHandlerWrapper{
 		handler:           handler,
 		backoffCalculator: nil,
 	}
@@ -486,7 +486,7 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 	}
 }
 
-// handlerJobs fetches batch of jobs from db and routes them to handlers. Returns a total count of fetched jobs.
+// processJobs fetches batch of jobs from db and routes them to handlers. Returns a total count of fetched jobs.
 func (q *Queue) processJobs(ctx context.Context) int {
 	// Fetch jobs from db first
 	jobs, err := q.fetchJobs(ctx)
@@ -553,7 +553,7 @@ const _fetchJobsSQL = `
 	SET status = $2,
 	    attempts = attempts + 1,
 	    run_at = now(),
-		stuck_at = now() + (stuck_timeout_millis * interval '1 millisecond')
+	    stuck_at = now() + (stuck_timeout_millis * interval '1 millisecond')
 	FROM candidates
 	WHERE j.id = candidates.id
 	RETURNING j.id, j.queue, j.payload, j.status, j.priority, j.attempts, j.max_attempts, j.stuck_timeout_millis,
@@ -602,12 +602,20 @@ func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
 func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 	handler, exists := q.handlers[job.Queue]
 	if !exists {
-		log.Printf("[PQueue][ERROR] No handler registered for queue '%s', job '%s' will be rescheduled", job.Queue, job.ID)
+		log.Printf(
+			"[PQueue][ERROR] No handler registered for queue '%s', job '%s' will be rescheduled",
+			job.Queue,
+			job.ID,
+		)
 
 		// Use a blank handler so handleJobError falls back to the configured default backoff.
 		// The job will be retried until MaxAttempts is reached,
 		// at which point it moves to the dead-letter queue like any other failure.
-		return q.handleJobError(ctx, &jobHandler{}, job, fmt.Errorf("no handler registered for queue '%s'", job.Queue))
+		//
+		//nolint:exhaustruct // should be empty handler
+		return q.handleJobError(
+			ctx, &jobHandlerWrapper{}, job, fmt.Errorf("no handler registered for queue '%s'", job.Queue),
+		)
 	}
 
 	if err := handler.handler(ctx, job); err != nil {
@@ -643,7 +651,7 @@ func (q *Queue) completeJob(ctx context.Context, job *Job) error {
 // handleJobError handles job processing errors with backoff.
 func (q *Queue) handleJobError(
 	ctx context.Context,
-	jobHandler *jobHandler,
+	jobHandler *jobHandlerWrapper,
 	job *Job,
 	err error,
 ) error {
@@ -690,6 +698,7 @@ func (q *Queue) failJob(ctx context.Context, job *Job, err error) error {
 	cmd, err := q.db.Exec(ctx, `
 		UPDATE pqueue_jobs
 		SET status = $2,
+		    completed_at = now(),
 		    error_message = $3
 		WHERE id = $1
 	`, job.ID, JobStatusFailed, errMsg)
@@ -724,7 +733,7 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 		WHERE id IN (
 		  SELECT id FROM pqueue_jobs
 		  WHERE status = $1
-			AND created_at < $2
+		    AND created_at < $2
 		  LIMIT $3
 		)
 	`
@@ -766,7 +775,7 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 		WHERE id IN (
 		  SELECT id FROM pqueue_jobs
 		  WHERE status = $1
-			AND created_at < $2
+		    AND created_at < $2
 		  LIMIT $3
 		)
 	`
