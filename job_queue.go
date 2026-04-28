@@ -217,6 +217,7 @@ type Queue struct {
 
 	handlers map[string]*jobHandlerWrapper
 	wg       sync.WaitGroup
+	stopped  chan struct{}
 }
 
 // NewQueue creates a new job queue.
@@ -236,6 +237,7 @@ func NewQueue(
 
 		handlers: make(map[string]*jobHandlerWrapper),
 		wg:       sync.WaitGroup{},
+		stopped:  make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -443,22 +445,28 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]preparedJob, error) {
 func (q *Queue) Start(ctx context.Context) {
 	// Start handler worker
 	q.wg.Go(func() {
-		q.runHandlerWorker(ctx)
+		// Unlink original context cancellation to gracefully stop the worker later
+		workerCtx := context.WithoutCancel(ctx)
+
+		q.runHandlerWorker(workerCtx)
 	})
 }
 
 // Stop gracefully stops the queue.
 func (q *Queue) Stop(ctx context.Context) error {
-	stopped := make(chan struct{}, 1)
+	close(q.stopped) // stop signal
+
+	// Try to wait for graceful shutdown
+	done := make(chan struct{})
 
 	go func() {
 		q.wg.Wait()
 
-		stopped <- struct{}{}
+		close(done)
 	}()
 
 	select {
-	case <-stopped:
+	case <-done:
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("context done: %w", ctx.Err())
@@ -473,6 +481,10 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Force stop (should never happen though)
+			return
+		case <-q.stopped:
+			// Graceful stop
 			return
 		case <-ticker.C:
 			for {
@@ -480,7 +492,14 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 				if fetched == 0 {
 					break // no more jobs, wait for the next timer tick
 				}
-				// There are more jobs to process, handle them immediately
+
+				// There are more jobs to process, handle them immediately.
+				// But first check if the worker has been stopped during processing.
+				select {
+				case <-q.stopped:
+					return
+				default:
+				}
 			}
 		}
 	}
