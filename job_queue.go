@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -47,19 +45,18 @@ type Job struct {
 	UpdatedAt          time.Time
 }
 
-// JobOption is a function to configure job options.
-type JobOption func(*jobOptions)
-
-type jobOptions struct {
+// JobOptions is an inner holder of provided job options.
+type JobOptions struct {
 	priority     int
 	maxAttempts  uint
 	stuckTimeout time.Duration
 	scheduledAt  time.Time
 }
 
-func defaultJobOptions() *jobOptions {
+// defaultJobOptions returns the default options for a job.
+func defaultJobOptions() JobOptions {
 	//nolint:mnd // default values
-	return &jobOptions{
+	return JobOptions{
 		priority:     0,
 		maxAttempts:  1,
 		stuckTimeout: time.Minute * 10,
@@ -67,35 +64,54 @@ func defaultJobOptions() *jobOptions {
 	}
 }
 
-func (j *jobOptions) stuckTimeoutMillis() int64 {
-	return int64(j.stuckTimeout / time.Millisecond)
+// Priority returns job priority.
+func (o JobOptions) Priority() int {
+	return o.priority
 }
 
-// WithPriority sets the job priority.
-func WithPriority(priority int) JobOption {
-	return func(o *jobOptions) {
+// MaxAttempts returns job max attempt count.
+func (o JobOptions) MaxAttempts() uint {
+	return o.maxAttempts
+}
+
+// StuckTimeoutMillis returns job stuck timeout in milliseconds.
+func (o JobOptions) StuckTimeoutMillis() int64 {
+	return int64(o.stuckTimeout / time.Millisecond)
+}
+
+// ScheduledAt returns job schedule.
+func (o JobOptions) ScheduledAt() time.Time {
+	return o.scheduledAt
+}
+
+// JobOption is a function to configure job options.
+type JobOption func(*JobOptions)
+
+// WithJobPriority sets the job priority.
+func WithJobPriority(priority int) JobOption {
+	return func(o *JobOptions) {
 		o.priority = priority
 	}
 }
 
-// WithScheduledAt sets when the job should be executed.
-func WithScheduledAt(t time.Time) JobOption {
-	return func(o *jobOptions) {
-		o.scheduledAt = t
+// WithJobMaxAttempts sets the maximum number of attempts.
+func WithJobMaxAttempts(attempts uint) JobOption {
+	return func(o *JobOptions) {
+		o.maxAttempts = attempts
 	}
 }
 
-// WithStuckTimeout sets when the job should be considered as stuck.
-func WithStuckTimeout(t time.Duration) JobOption {
-	return func(o *jobOptions) {
+// WithJobStuckTimeout sets when the job should be considered as stuck.
+func WithJobStuckTimeout(t time.Duration) JobOption {
+	return func(o *JobOptions) {
 		o.stuckTimeout = t
 	}
 }
 
-// WithMaxAttempts sets the maximum number of attempts.
-func WithMaxAttempts(attempts uint) JobOption {
-	return func(o *jobOptions) {
-		o.maxAttempts = attempts
+// WithJobScheduledAt sets when the job should be executed.
+func WithJobScheduledAt(t time.Time) JobOption {
+	return func(o *JobOptions) {
+		o.scheduledAt = t
 	}
 }
 
@@ -128,7 +144,8 @@ func (h *jobHandlerWrapper) calculateBackoff(attempt uint, defaultBackoff time.D
 // JobHandlerOption is a function to configure job handler options.
 type JobHandlerOption func(*jobHandlerWrapper)
 
-func WithBackoffCalculator(backoffCalculator BackoffCalculator) JobHandlerOption {
+// WithJobHandlerBackoffCalculator sets a backoff calculator for job handler.
+func WithJobHandlerBackoffCalculator(backoffCalculator BackoffCalculator) JobHandlerOption {
 	return func(h *jobHandlerWrapper) {
 		h.backoffCalculator = backoffCalculator
 	}
@@ -202,8 +219,8 @@ func DefaultConfig() *QueueConfig {
 // QueueOption is a function to configure queue options.
 type QueueOption func(*Queue)
 
-// WithEncoder sets the encoder to marshal and unmarshal job payload.
-func WithEncoder(encoder Encoder) QueueOption {
+// WithQueueEncoder sets the encoder to marshal and unmarshal job payload.
+func WithQueueEncoder(encoder Encoder) QueueOption {
 	return func(q *Queue) {
 		q.encoder = encoder
 	}
@@ -211,7 +228,7 @@ func WithEncoder(encoder Encoder) QueueOption {
 
 // Queue represents the job queue.
 type Queue struct {
-	db      *pgxpool.Pool
+	storage Storage
 	config  *QueueConfig
 	encoder Encoder
 
@@ -222,7 +239,7 @@ type Queue struct {
 
 // NewQueue creates a new job queue.
 func NewQueue(
-	db *pgxpool.Pool,
+	storage Storage,
 	config *QueueConfig,
 	opts ...QueueOption,
 ) *Queue {
@@ -231,7 +248,7 @@ func NewQueue(
 	}
 
 	queue := &Queue{
-		db:      db,
+		storage: storage,
 		config:  config,
 		encoder: &JsonEncoder{},
 
@@ -261,15 +278,6 @@ func (q *Queue) RegisterHandler(jobType string, handler JobHandler, opts ...JobH
 	q.handlers[jobType] = handlerWrapper
 }
 
-const _enqueueJobSQL = `
-	INSERT INTO pqueue_jobs (id, queue, payload, priority, max_attempts, stuck_timeout_millis, scheduled_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)
-	ON CONFLICT (id) DO UPDATE
-	SET id = pqueue_jobs.id
-	RETURNING id, queue, payload, status, priority, attempts, max_attempts, stuck_timeout_millis,
-	          scheduled_at, run_at, stuck_at, completed_at, error_message, created_at, updated_at
-`
-
 // Enqueue adds a new job to the queue.
 func (q *Queue) Enqueue(
 	ctx context.Context,
@@ -285,7 +293,7 @@ func (q *Queue) Enqueue(
 
 	options := defaultJobOptions()
 	for _, opt := range opts {
-		opt(options)
+		opt(&options)
 	}
 
 	var payloadBytes []byte
@@ -299,29 +307,19 @@ func (q *Queue) Enqueue(
 		}
 	}
 
-	var job Job
-
-	err := queryer.QueryRow(
+	job, err := q.storage.InsertJob(
 		ctx,
-		_enqueueJobSQL,
+		queryer,
 		id,
 		queue,
 		payloadBytes,
-		options.priority,
-		options.maxAttempts,
-		options.stuckTimeoutMillis(),
-		options.scheduledAt,
-	).
-		Scan(
-			&job.ID, &job.Queue, &job.Payload, &job.Status, &job.Priority,
-			&job.Attempts, &job.MaxAttempts, &job.StuckTimeoutMillis, &job.ScheduledAt, &job.RunAt,
-			&job.StuckAt, &job.CompletedAt, &job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt,
-		)
+		options,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("insert job: %w", err)
+		return nil, fmt.Errorf("insert job into storage: %w", err)
 	}
 
-	return &job, nil
+	return job, nil
 }
 
 // BatchJob describes a single job to be enqueued as part of a batch.
@@ -334,10 +332,10 @@ type BatchJob struct {
 
 // EnqueueBatch inserts all provided jobs in a single database round-trip.
 // It returns the persisted Job records in the same order as the input slice.
-// The call is atomic when sender is a pgx.Tx.
+// The call is atomic when batcher is a pgx.Tx.
 func (q *Queue) EnqueueBatch(
 	ctx context.Context,
-	sender BatchSender,
+	batcher BatchSender,
 	jobs []BatchJob,
 ) ([]*Job, error) {
 	if len(jobs) == 0 {
@@ -350,65 +348,46 @@ func (q *Queue) EnqueueBatch(
 		return nil, fmt.Errorf("prepare batch jobs: %w", err)
 	}
 
-	// Build the pgx batch
-	var batch pgx.Batch
-
-	for _, p := range preparedJobs {
-		batch.Queue(
-			_enqueueJobSQL,
-			p.id,
-			p.queue,
-			p.payload,
-			p.options.priority,
-			p.options.maxAttempts,
-			p.options.stuckTimeoutMillis(),
-			p.options.scheduledAt,
-		)
+	enqueuedJobs, err := q.storage.InsertBatchJobs(ctx, batcher, preparedJobs)
+	if err != nil {
+		return nil, fmt.Errorf("insert batch jobs into storage: %w", err)
 	}
 
-	batchResults := sender.SendBatch(ctx, &batch)
-
-	// Scan results in the same order the queries were queued
-	enqueued := make([]*Job, len(jobs))
-
-	for i := range preparedJobs {
-		var job Job
-
-		err = batchResults.QueryRow().Scan(
-			&job.ID, &job.Queue, &job.Payload, &job.Status, &job.Priority,
-			&job.Attempts, &job.MaxAttempts, &job.StuckTimeoutMillis, &job.ScheduledAt, &job.RunAt,
-			&job.StuckAt, &job.CompletedAt, &job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt,
-		)
-		if err != nil {
-			// Close drains remaining results before we return
-			_ = batchResults.Close()
-
-			return nil, fmt.Errorf("scan result for job at index %d (queue '%s'): %w", i, preparedJobs[i].queue, err)
-		}
-
-		enqueued[i] = &job
-	}
-
-	// Close flushes any un-read results and returns any deferred server error
-	if err = batchResults.Close(); err != nil {
-		return nil, fmt.Errorf("close batch results: %w", err)
-	}
-
-	return enqueued, nil
+	return enqueuedJobs, nil
 }
 
-// preparedJob is inner representation of a single job from a batch to be processed.
-type preparedJob struct {
+// PreparedBatchJob is inner representation of a single job from a batch to be processed.
+type PreparedBatchJob struct {
 	id      uuid.UUID
 	queue   string
 	payload []byte
-	options *jobOptions
+	options JobOptions
+}
+
+// ID returns an id of a prepared job.
+func (j PreparedBatchJob) ID() uuid.UUID {
+	return j.id
+}
+
+// Queue returns a queue of a prepared job.
+func (j PreparedBatchJob) Queue() string {
+	return j.queue
+}
+
+// Payload returns payload of a prepared job.
+func (j PreparedBatchJob) Payload() []byte {
+	return j.payload
+}
+
+// Options returns options of a prepared job.
+func (j PreparedBatchJob) Options() JobOptions {
+	return j.options
 }
 
 // prepareBatchJobs encodes every payload and applies options up front
 // so we don't partially send the batch on an encoding error.
-func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]preparedJob, error) {
-	prepared := make([]preparedJob, len(jobs))
+func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
+	prepared := make([]PreparedBatchJob, len(jobs))
 	for i, batchJob := range jobs {
 		if batchJob.Queue == "" {
 			return nil, fmt.Errorf("job at index %d: queue name must not be empty", i)
@@ -416,7 +395,7 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]preparedJob, error) {
 
 		options := defaultJobOptions()
 		for _, opt := range batchJob.Opts {
-			opt(options)
+			opt(&options)
 		}
 
 		var payloadBytes []byte
@@ -430,7 +409,7 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]preparedJob, error) {
 			}
 		}
 
-		prepared[i] = preparedJob{
+		prepared[i] = PreparedBatchJob{
 			id:      batchJob.ID,
 			queue:   batchJob.Queue,
 			payload: payloadBytes,
@@ -544,73 +523,14 @@ func (q *Queue) processJobs(ctx context.Context) int {
 	return len(jobs)
 }
 
-const _fetchJobsSQL = `
-	WITH candidates AS (
-	  (
-	    SELECT id, priority, scheduled_at
-	    FROM pqueue_jobs
-	    WHERE status = $1
-	      AND scheduled_at <= now()
-	    ORDER BY priority DESC, scheduled_at
-	    LIMIT $3
-	  )
-	  UNION ALL
-	  (
-	    SELECT id, priority, scheduled_at
-	    FROM pqueue_jobs
-	    WHERE status = $2
-	      AND stuck_at <= now()
-	    ORDER BY priority DESC, scheduled_at
-	    LIMIT $3
-	  )
-	  ORDER BY priority DESC, scheduled_at
-	  LIMIT $3
-	  FOR NO KEY UPDATE SKIP LOCKED
-	)
-
-	UPDATE pqueue_jobs AS j
-	SET status = $2,
-	    attempts = attempts + 1,
-	    run_at = now(),
-	    stuck_at = now() + (stuck_timeout_millis * interval '1 millisecond')
-	FROM candidates
-	WHERE j.id = candidates.id
-	RETURNING j.id, j.queue, j.payload, j.status, j.priority, j.attempts, j.max_attempts, j.stuck_timeout_millis,
-	          j.scheduled_at, j.run_at, j.stuck_at, j.completed_at, j.error_message, j.created_at, j.updated_at
-`
-
 // fetchJobs fetches batch of jobs from db.
 func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	rows, err := q.db.Query(ctx, _fetchJobsSQL, JobStatusPending, JobStatusRunning, q.config.Poll.BatchSize)
+	jobs, err := q.storage.ListActiveJobs(ctx, q.config.Poll.BatchSize)
 	if err != nil {
-		return nil, fmt.Errorf("fetch jobs: %w", err)
-	}
-	defer rows.Close()
-
-	jobs := make([]Job, 0, q.config.Poll.BatchSize)
-
-	for rows.Next() {
-		var job Job
-
-		err = rows.Scan(
-			&job.ID, &job.Queue, &job.Payload, &job.Status, &job.Priority,
-			&job.Attempts, &job.MaxAttempts, &job.StuckTimeoutMillis, &job.ScheduledAt, &job.RunAt,
-			&job.StuckAt, &job.CompletedAt, &job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt,
-		)
-		if err != nil {
-			log.Printf("[PQueue][ERROR] Failed to scan job: %v", err)
-
-			continue
-		}
-
-		jobs = append(jobs, job)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate over jobs: %w", err)
+		return nil, fmt.Errorf("list active jobs from storage: %w", err)
 	}
 
 	return jobs, nil
@@ -649,19 +569,8 @@ func (q *Queue) completeJob(ctx context.Context, job *Job) error {
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	cmd, err := q.db.Exec(ctx, `
-		UPDATE pqueue_jobs
-		SET status = $2,
-		    completed_at = now(),
-		    error_message = NULL
-		WHERE id = $1
-	`, job.ID, JobStatusCompleted)
-	if err != nil {
-		return fmt.Errorf("complete job: %w", err)
-	}
-
-	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("job with id '%s' was not marked as completed", job.ID)
+	if err := q.storage.CompleteJob(ctx, job.ID); err != nil {
+		return fmt.Errorf("complete job in storage: %w", err)
 	}
 
 	return nil
@@ -672,61 +581,39 @@ func (q *Queue) handleJobError(
 	ctx context.Context,
 	jobHandler *jobHandlerWrapper,
 	job *Job,
-	err error,
+	handleErr error,
 ) error {
 	// Do not retry unrecoverable errors and jobs that reach their limit
-	if IsUnrecoverable(err) || job.Attempts >= job.MaxAttempts {
-		return q.failJob(ctx, job, err)
+	if IsUnrecoverable(handleErr) || job.Attempts >= job.MaxAttempts {
+		return q.failJob(ctx, job, handleErr)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	errMsg := err.Error()
+	errMsg := handleErr.Error()
 
 	// Calculate backoff duration
 	backoff := jobHandler.calculateBackoff(job.Attempts, q.config.Processing.DefaultBackoff)
 	nextSchedule := time.Now().Add(backoff)
 
 	// Update a job with new schedule
-	cmd, err := q.db.Exec(ctx, `
-		UPDATE pqueue_jobs
-		SET status = $2,
-		    scheduled_at = $3,
-		    error_message = $4
-		WHERE id = $1
-	`, job.ID, JobStatusPending, nextSchedule, errMsg)
-	if err != nil {
-		return fmt.Errorf("re-schedule job: %w", err)
-	}
-
-	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("job with id '%s' was not re-scheduled", job.ID)
+	if err := q.storage.ReScheduleJob(ctx, job.ID, nextSchedule, errMsg); err != nil {
+		return fmt.Errorf("reschedule job in storage: %w", err)
 	}
 
 	return nil
 }
 
 // failJob immediately fails a job moving it to the dead letter queue.
-func (q *Queue) failJob(ctx context.Context, job *Job, err error) error {
+func (q *Queue) failJob(ctx context.Context, job *Job, handleErr error) error {
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	errMsg := err.Error()
+	errMsg := handleErr.Error()
 
-	cmd, err := q.db.Exec(ctx, `
-		UPDATE pqueue_jobs
-		SET status = $2,
-		    completed_at = now(),
-		    error_message = $3
-		WHERE id = $1
-	`, job.ID, JobStatusFailed, errMsg)
-	if err != nil {
-		return fmt.Errorf("fail job: %w", err)
-	}
-
-	if cmd.RowsAffected() == 0 {
-		return fmt.Errorf("job with id '%s' was not marked as failed", job.ID)
+	if err := q.storage.FailJob(ctx, job.ID, errMsg); err != nil {
+		return fmt.Errorf("fail job in storage: %w", err)
 	}
 
 	return nil
@@ -747,22 +634,12 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 	defer cancel()
 
 	cutoffDate := time.Now().Add(-q.config.ColdCleanup.RetentionInterval)
-	sql := `
-		DELETE FROM pqueue_jobs
-		WHERE id IN (
-		  SELECT id FROM pqueue_jobs
-		  WHERE status = $1
-		    AND created_at < $2
-		  LIMIT $3
-		)
-	`
 
-	cmd, err := q.db.Exec(ctx, sql, JobStatusCompleted, cutoffDate, q.config.ColdCleanup.CleanupBatchSize)
+	rowsAffected, err := q.storage.DeleteColdJobs(ctx, cutoffDate, q.config.ColdCleanup.CleanupBatchSize)
 	if err != nil {
-		return fmt.Errorf("clean cold jobs: %w", err)
+		return fmt.Errorf("delete cold jobs from storage: %w", err)
 	}
 
-	rowsAffected := cmd.RowsAffected()
 	if rowsAffected == 0 {
 		log.Printf("[PQueue][INFO] No cold jobs to be cleaned up")
 
@@ -789,22 +666,12 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 	defer cancel()
 
 	cutoffDate := time.Now().Add(-q.config.DeadCleanup.RetentionInterval)
-	sql := `
-		DELETE FROM pqueue_jobs
-		WHERE id IN (
-		  SELECT id FROM pqueue_jobs
-		  WHERE status = $1
-		    AND created_at < $2
-		  LIMIT $3
-		)
-	`
 
-	cmd, err := q.db.Exec(ctx, sql, JobStatusFailed, cutoffDate, q.config.DeadCleanup.CleanupBatchSize)
+	rowsAffected, err := q.storage.DeleteDeadJobs(ctx, cutoffDate, q.config.DeadCleanup.CleanupBatchSize)
 	if err != nil {
-		return fmt.Errorf("clean dead jobs: %w", err)
+		return fmt.Errorf("delete dead jobs from storage: %w", err)
 	}
 
-	rowsAffected := cmd.RowsAffected()
 	if rowsAffected == 0 {
 		log.Printf("[PQueue][INFO] No dead jobs to be cleaned up")
 
