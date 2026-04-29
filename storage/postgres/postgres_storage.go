@@ -169,7 +169,7 @@ func (s *Storage) InsertBatchJobs(
 }
 
 const _fetchJobsSQL = `
-	WITH candidates AS (
+	WITH pre_candidates AS (
 	  (
 	    SELECT id, priority, scheduled_at
 	    FROM pqueue_jobs
@@ -187,6 +187,10 @@ const _fetchJobsSQL = `
 	    ORDER BY priority DESC, scheduled_at
 	    LIMIT $3
 	  )
+	),
+	candidates AS (
+	  SELECT id
+	  FROM pre_candidates
 	  ORDER BY priority DESC, scheduled_at
 	  LIMIT $3
 	  FOR NO KEY UPDATE SKIP LOCKED
