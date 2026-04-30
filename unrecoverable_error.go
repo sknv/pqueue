@@ -15,6 +15,7 @@ func (e unrecoverableError) Error() string {
 	return e.error.Error()
 }
 
+// Unwrap implements Go interface to unwrap underlying errors.
 func (e unrecoverableError) Unwrap() error {
 	return e.error
 }

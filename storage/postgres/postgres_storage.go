@@ -321,7 +321,7 @@ func (s *Storage) FailJob(ctx context.Context, id uuid.UUID, errorMessage string
 		UPDATE pqueue_jobs
 		SET status = $2,
 		    completed_at = now(),
-	        error_message = $3
+		    error_message = $3
 		WHERE id = $1
 	`
 
@@ -359,7 +359,7 @@ func (s *Storage) deleteJobs(
 		WHERE id IN (
 		  SELECT id FROM pqueue_jobs
 		  WHERE status = $1
-		  AND created_at < $2
+		    AND created_at < $2
 		  LIMIT $3
 		)
 	`

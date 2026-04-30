@@ -20,10 +20,14 @@ import (
 type JobStatus string
 
 const (
-	JobStatusPending   JobStatus = "pending"
-	JobStatusRunning   JobStatus = "running"
+	// JobStatusPending indicates the job is waiting to be picked up.
+	JobStatusPending JobStatus = "pending"
+	// JobStatusRunning indicates the job is currently being processed.
+	JobStatusRunning JobStatus = "running"
+	// JobStatusCompleted indicates the job finished successfully.
 	JobStatusCompleted JobStatus = "completed"
-	JobStatusFailed    JobStatus = "failed"
+	// JobStatusFailed indicates the job exhausted all retry attempts and has been moved to the dead-letter queue.
+	JobStatusFailed JobStatus = "failed"
 )
 
 // Job represents a job in the queue.
@@ -45,7 +49,7 @@ type Job struct {
 	UpdatedAt          time.Time
 }
 
-// JobOptions is an inner holder of provided job options.
+// JobOptions holds the resolved options for a job.
 type JobOptions struct {
 	priority     int
 	maxAttempts  uint
@@ -79,7 +83,7 @@ func (o JobOptions) StuckTimeoutMillis() int64 {
 	return int64(o.stuckTimeout / time.Millisecond)
 }
 
-// ScheduledAt returns job schedule.
+// ScheduledAt returns the time at which the job is scheduled to run.
 func (o JobOptions) ScheduledAt() time.Time {
 	return o.scheduledAt
 }
@@ -219,7 +223,7 @@ func DefaultConfig() *QueueConfig {
 // QueueOption is a function to configure queue options.
 type QueueOption func(*Queue)
 
-// WithQueueEncoder sets the encoder to marshal and unmarshal job payload.
+// WithQueueEncoder sets the encoder used to marshal job payloads.
 func WithQueueEncoder(encoder Encoder) QueueOption {
 	return func(q *Queue) {
 		q.encoder = encoder
@@ -356,7 +360,8 @@ func (q *Queue) EnqueueBatch(
 	return enqueuedJobs, nil
 }
 
-// PreparedBatchJob is inner representation of a single job from a batch to be processed.
+// PreparedBatchJob is an internal representation of a batch job with its payload
+// already encoded and options resolved. It is passed to Storage.InsertBatchJobs.
 type PreparedBatchJob struct {
 	id      uuid.UUID
 	queue   string

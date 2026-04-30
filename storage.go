@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 )
 
+// Storage defines the persistence layer for the job queue.
 type Storage interface {
 	InsertJob(
 		ctx context.Context,
