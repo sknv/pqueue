@@ -44,7 +44,7 @@ const _insertJobSQL = `
 	          status,
 	          priority,
 	          attempts,
-              max_attempts,
+	          max_attempts,
 	          stuck_timeout_millis,
 	          scheduled_at,
 	          run_at,
