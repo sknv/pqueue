@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -77,9 +76,10 @@ func main() {
 	}
 
 	queue := pqueue.NewQueue(storage, config)
+	decoder := queue.Decoder()
 
 	// Register job handlers
-	queue.RegisterHandler("email", HandleEmailJob,
+	queue.RegisterHandler("email", HandleEmailJob(decoder),
 		pqueue.WithJobHandlerBackoffCalculator(CalculateBackoff))
 
 	// Start the queue processor
@@ -116,28 +116,30 @@ type EmailJob struct {
 	Body    string `json:"body"`
 }
 
-func HandleEmailJob(ctx context.Context, job *pqueue.Job) error {
-	var payload EmailJob
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("failed to unmarshal email job payload: %w", err)
+func HandleEmailJob(decoder pqueue.Decoder) pqueue.JobHandler {
+	return func(ctx context.Context, job *pqueue.Job) error {
+		var payload EmailJob
+		if err := decoder(job.Payload, &payload); err != nil {
+			return fmt.Errorf("failed to unmarshal email job payload: %w", err)
+		}
+
+		log.Printf("Processing email job %s: Sending email to %s with subject: %s\n",
+			job.ID, payload.To, payload.Subject)
+
+		// Simulate email sending
+		time.Sleep(100 * time.Millisecond)
+
+		// Simulate occasional failures for testing retry logic
+		if rand.N(3)%3 == 0 {
+			log.Printf("Temporary email service error for job %s", job.ID)
+
+			return fmt.Errorf("temporary email service error")
+		}
+
+		log.Printf("Email job %s completed successfully", job.ID)
+
+		return nil
 	}
-
-	log.Printf("Processing email job %s: Sending email to %s with subject: %s\n",
-		job.ID, payload.To, payload.Subject)
-
-	// Simulate email sending
-	time.Sleep(100 * time.Millisecond)
-
-	// Simulate occasional failures for testing retry logic
-	if rand.N(3)%3 == 0 {
-		log.Printf("Temporary email service error for job %s", job.ID)
-
-		return fmt.Errorf("temporary email service error")
-	}
-
-	log.Printf("Email job %s completed successfully", job.ID)
-
-	return nil
 }
 
 func CalculateBackoff(attempt uint) time.Duration {

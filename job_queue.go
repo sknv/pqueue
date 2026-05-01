@@ -63,7 +63,7 @@ func defaultJobOptions() JobOptions {
 	return JobOptions{
 		priority:     0,
 		maxAttempts:  1,
-		stuckTimeout: time.Minute * 10,
+		stuckTimeout: time.Minute * 5,
 		scheduledAt:  time.Now(),
 	}
 }
@@ -158,11 +158,6 @@ func WithJobHandlerBackoffCalculator(backoffCalculator BackoffCalculator) JobHan
 //
 // Queue
 //
-
-// Encoder marshals job payload.
-type Encoder interface {
-	Encode(v any) ([]byte, error)
-}
 
 type (
 	// PollConfig configures the poller loop.
@@ -423,6 +418,11 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
 	}
 
 	return prepared, nil
+}
+
+// Decoder return the queue decoder.
+func (q *Queue) Decoder() Decoder {
+	return q.encoder.Decode
 }
 
 // Start begins processing jobs.
