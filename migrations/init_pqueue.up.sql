@@ -19,6 +19,7 @@ CREATE TYPE pqueue_job_status AS ENUM (
 
 CREATE TABLE IF NOT EXISTS pqueue_jobs (
   id                   uuid              PRIMARY KEY DEFAULT uuidv7(),
+  idempotency_key      uuid              NOT NULL CONSTRAINT chk__pqueue_jobs__unique_idempotency_key UNIQUE,
   queue                text              NOT NULL,
   payload              bytea,
   status               pqueue_job_status NOT NULL DEFAULT 'pending',
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS pqueue_jobs (
 );
 
 COMMENT ON TABLE pqueue_jobs IS 'Очередь задач';
+COMMENT ON COLUMN pqueue_jobs.idempotency_key IS 'Ключ идемпотентности';
 COMMENT ON COLUMN pqueue_jobs.queue IS 'Имя очереди';
 COMMENT ON COLUMN pqueue_jobs.payload IS 'Нагрузка для задачи';
 COMMENT ON COLUMN pqueue_jobs.priority IS 'Приоритет выполнения: чем больше, тем выше приоритет';

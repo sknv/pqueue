@@ -13,6 +13,7 @@ type Storage interface {
 		ctx context.Context,
 		queryer QueryRower,
 		id uuid.UUID,
+		idempotencyKey uuid.UUID,
 		queue string,
 		payload []byte,
 		options JobOptions,

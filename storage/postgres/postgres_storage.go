@@ -28,6 +28,7 @@ func NewStorage(db *pgxpool.Pool) *Storage {
 const _insertJobSQL = `
 	INSERT INTO pqueue_jobs (
 	  id,
+	  idempotency_key,
 	  queue,
 	  payload,
 	  priority,
@@ -35,10 +36,11 @@ const _insertJobSQL = `
 	  stuck_timeout_millis,
 	  scheduled_at
 	)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)
-	ON CONFLICT (id) DO UPDATE
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	ON CONFLICT (idempotency_key) DO UPDATE
 	SET id = pqueue_jobs.id
 	RETURNING id,
+	          idempotency_key,
 	          queue,
 	          payload,
 	          status,
@@ -60,6 +62,7 @@ func (s *Storage) InsertJob(
 	ctx context.Context,
 	queryer pqueue.QueryRower,
 	id uuid.UUID,
+	idempotencyKey uuid.UUID,
 	queue string,
 	payload []byte,
 	options pqueue.JobOptions,
@@ -70,6 +73,7 @@ func (s *Storage) InsertJob(
 		ctx,
 		_insertJobSQL,
 		id,
+		idempotencyKey,
 		queue,
 		payload,
 		options.Priority(),
@@ -79,6 +83,7 @@ func (s *Storage) InsertJob(
 	).
 		Scan(
 			&job.ID,
+			&job.IdempotencyKey,
 			&job.Queue,
 			&job.Payload,
 			&job.Status,
@@ -116,6 +121,7 @@ func (s *Storage) InsertBatchJobs(
 		batch.Queue(
 			_insertJobSQL,
 			job.ID(),
+			job.IdempotencyKey(),
 			job.Queue(),
 			job.Payload(),
 			options.Priority(),
@@ -135,6 +141,7 @@ func (s *Storage) InsertBatchJobs(
 
 		err := batchResults.QueryRow().Scan(
 			&job.ID,
+			&job.IdempotencyKey,
 			&job.Queue,
 			&job.Payload,
 			&job.Status,
@@ -204,6 +211,7 @@ const _fetchJobsSQL = `
 	FROM candidates
 	WHERE j.id = candidates.id
 	RETURNING j.id,
+	          j.idempotency_key,
 	          j.queue,
 	          j.payload,
 	          j.status,
@@ -235,6 +243,7 @@ func (s *Storage) ListActiveJobs(ctx context.Context, batchSize uint) ([]pqueue.
 
 		err = rows.Scan(
 			&job.ID,
+			&job.IdempotencyKey,
 			&job.Queue,
 			&job.Payload,
 			&job.Status,
