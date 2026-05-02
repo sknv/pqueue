@@ -33,6 +33,7 @@ const (
 // Job represents a job in the queue.
 type Job struct {
 	ID                 uuid.UUID
+	IdempotencyKey     uuid.UUID
 	Queue              string
 	Payload            []byte
 	Status             JobStatus
@@ -281,18 +282,13 @@ func (q *Queue) RegisterHandler(jobType string, handler JobHandler, opts ...JobH
 func (q *Queue) Enqueue(
 	ctx context.Context,
 	queryer QueryRower,
-	id uuid.UUID,
 	queue string,
+	idempotencyKey uuid.UUID,
 	payload any,
 	opts ...JobOption,
 ) (*Job, error) {
 	if queue == "" {
 		return nil, errors.New("queue name must not be empty")
-	}
-
-	options := defaultJobOptions()
-	for _, opt := range opts {
-		opt(&options)
 	}
 
 	var payloadBytes []byte
@@ -306,10 +302,18 @@ func (q *Queue) Enqueue(
 		}
 	}
 
+	id := uuid.Must(uuid.NewV7())
+
+	options := defaultJobOptions()
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	job, err := q.storage.InsertJob(
 		ctx,
 		queryer,
 		id,
+		idempotencyKey,
 		queue,
 		payloadBytes,
 		options,
@@ -323,10 +327,10 @@ func (q *Queue) Enqueue(
 
 // BatchJob describes a single job to be enqueued as part of a batch.
 type BatchJob struct {
-	ID      uuid.UUID
-	Queue   string
-	Payload any
-	Opts    []JobOption
+	Queue          string
+	IdempotencyKey uuid.UUID
+	Payload        any
+	Opts           []JobOption
 }
 
 // EnqueueBatch inserts all provided jobs in a single database round-trip.
@@ -358,15 +362,21 @@ func (q *Queue) EnqueueBatch(
 // PreparedBatchJob is an internal representation of a batch job with its payload
 // already encoded and options resolved. It is passed to Storage.InsertBatchJobs.
 type PreparedBatchJob struct {
-	id      uuid.UUID
-	queue   string
-	payload []byte
-	options JobOptions
+	id             uuid.UUID
+	idempotencyKey uuid.UUID
+	queue          string
+	payload        []byte
+	options        JobOptions
 }
 
 // ID returns an id of a prepared job.
 func (j PreparedBatchJob) ID() uuid.UUID {
 	return j.id
+}
+
+// IdempotencyKey returns an idempotency key of a prepared job.
+func (j PreparedBatchJob) IdempotencyKey() uuid.UUID {
+	return j.idempotencyKey
 }
 
 // Queue returns a queue of a prepared job.
@@ -390,12 +400,7 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
 	prepared := make([]PreparedBatchJob, len(jobs))
 	for i, batchJob := range jobs {
 		if batchJob.Queue == "" {
-			return nil, fmt.Errorf("job at index %d: queue name must not be empty", i)
-		}
-
-		options := defaultJobOptions()
-		for _, opt := range batchJob.Opts {
-			opt(&options)
+			return nil, fmt.Errorf("job with idempotency key %s: queue name must not be empty", batchJob.IdempotencyKey)
 		}
 
 		var payloadBytes []byte
@@ -405,15 +410,23 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
 
 			payloadBytes, err = q.encoder.Encode(batchJob.Payload)
 			if err != nil {
-				return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
+				return nil, fmt.Errorf("job with idempotency key %s: encode payload: %w", batchJob.IdempotencyKey, err)
 			}
 		}
 
+		id := uuid.Must(uuid.NewV7())
+
+		options := defaultJobOptions()
+		for _, opt := range batchJob.Opts {
+			opt(&options)
+		}
+
 		prepared[i] = PreparedBatchJob{
-			id:      batchJob.ID,
-			queue:   batchJob.Queue,
-			payload: payloadBytes,
-			options: options,
+			id:             id,
+			idempotencyKey: batchJob.IdempotencyKey,
+			queue:          batchJob.Queue,
+			payload:        payloadBytes,
+			options:        options,
 		}
 	}
 

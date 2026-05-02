@@ -116,10 +116,10 @@ type EmailJob struct {
 	Body    string `json:"body"`
 }
 
-func HandleEmailJob(decoder pqueue.Decoder) pqueue.JobHandler {
+func HandleEmailJob(decode pqueue.Decoder) pqueue.JobHandler {
 	return func(ctx context.Context, job *pqueue.Job) error {
 		var payload EmailJob
-		if err := decoder(job.Payload, &payload); err != nil {
+		if err := decode(job.Payload, &payload); err != nil {
 			return fmt.Errorf("failed to unmarshal email job payload: %w", err)
 		}
 
@@ -155,7 +155,7 @@ func enqueueExampleJobs(ctx context.Context, db *pgxpool.Pool, queue *pqueue.Que
 		Body:    "Welcome to our service!",
 	}
 
-	job1, err := queue.Enqueue(ctx, db, uuid.Must(uuid.NewV7()), "email", emailJob)
+	job1, err := queue.Enqueue(ctx, db, "email", uuid.Must(uuid.NewV7()), emailJob)
 	if err != nil {
 		return fmt.Errorf("failed to enqueue email job: %w", err)
 	}
@@ -169,7 +169,7 @@ func enqueueExampleJobs(ctx context.Context, db *pgxpool.Pool, queue *pqueue.Que
 		Body:    "Critical system event detected",
 	}
 
-	job2, err := queue.Enqueue(ctx, db, uuid.Must(uuid.NewV7()), "email", urgentEmailJob,
+	job2, err := queue.Enqueue(ctx, db, "email", uuid.Must(uuid.NewV7()), urgentEmailJob,
 		pqueue.WithJobPriority(10))
 	if err != nil {
 		return fmt.Errorf("failed to enqueue urgent email job: %w", err)
@@ -187,7 +187,7 @@ func enqueueExampleJobs(ctx context.Context, db *pgxpool.Pool, queue *pqueue.Que
 
 		priority := i % 3 // Priorities 0, 1, 2
 
-		_, err := queue.Enqueue(ctx, db, uuid.Must(uuid.NewV7()), "email", batchEmailJob,
+		_, err := queue.Enqueue(ctx, db, "email", uuid.Must(uuid.NewV7()), batchEmailJob,
 			pqueue.WithJobPriority(priority),
 			pqueue.WithJobMaxAttempts(3),
 			pqueue.WithJobScheduledAt(time.Now().Add(time.Duration(i)*time.Second*3)))
