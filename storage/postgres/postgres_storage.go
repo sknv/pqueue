@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -260,9 +259,7 @@ func (s *Storage) ListActiveJobs(ctx context.Context, batchSize uint) ([]pqueue.
 			&job.UpdatedAt,
 		)
 		if err != nil {
-			log.Printf("[PQueue][ERROR] Failed to scan job: %v", err)
-
-			continue
+			return nil, fmt.Errorf("scan job: %w", err)
 		}
 
 		jobs = append(jobs, job)
