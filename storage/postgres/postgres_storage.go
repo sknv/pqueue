@@ -237,7 +237,7 @@ const _fetchJobsWithQueuesSQL = `
 	    SELECT id, priority, scheduled_at
 	    FROM pqueue_jobs
 	    WHERE queue = ANY($1)
-		  AND status = $2
+	      AND status = $2
 	      AND scheduled_at <= now()
 	    ORDER BY priority DESC, scheduled_at
 	    LIMIT $4
@@ -247,7 +247,7 @@ const _fetchJobsWithQueuesSQL = `
 	    SELECT id, priority, scheduled_at
 	    FROM pqueue_jobs
 	    WHERE queue = ANY($1)
-		  AND status = $3
+	      AND status = $3
 	      AND stuck_at <= now()
 	    ORDER BY priority DESC, scheduled_at
 	    LIMIT $4
