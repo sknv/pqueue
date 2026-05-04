@@ -61,7 +61,8 @@ CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__pending_worker
 ON pqueue_jobs (priority DESC, scheduled_at)
 WHERE status = 'pending';
 
-CREATE INDEX idx__pqueue_jobs__pending_queue_worker
+-- Пропустите этот индекс, если не нужна выборка по конкретным очередям
+CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__pending_queue_worker
 ON pqueue_jobs (queue, priority DESC, scheduled_at)
 WHERE status = 'pending';
 
@@ -70,7 +71,8 @@ CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__stuck_worker
 ON pqueue_jobs (stuck_at)
 WHERE status = 'running';
 
-CREATE INDEX idx__pqueue_jobs__stuck_queue_worker
+-- Пропустите этот индекс, если не нужна выборка по конкретным очередям
+CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__stuck_queue_worker
 ON pqueue_jobs (queue, stuck_at)
 WHERE status = 'running';
 

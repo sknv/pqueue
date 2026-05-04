@@ -680,7 +680,7 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 		return nil
 	}
 
-	slog.LogAttrs(ctx, slog.LevelInfo, "Cleaned up cold jobs",
+	slog.LogAttrs(ctx, slog.LevelInfo, "Cold jobs cleaned up successfully",
 		slog.String("component", "pqueue"),
 		slog.Uint64("deleted_job_count", uint64(rowsAffected)),
 	)
@@ -719,7 +719,7 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 		return nil
 	}
 
-	slog.LogAttrs(ctx, slog.LevelInfo, "Cleaned up dead jobs",
+	slog.LogAttrs(ctx, slog.LevelInfo, "Dead jobs cleaned up successfully",
 		slog.String("component", "pqueue"),
 		slog.Uint64("deleted_job_count", uint64(rowsAffected)),
 	)
