@@ -439,13 +439,14 @@ func (q *Queue) Decoder() Decoder {
 }
 
 // Start begins processing jobs.
-func (q *Queue) Start(ctx context.Context) {
+// If optional queues argument provided worker will process only specified queues.
+func (q *Queue) Start(ctx context.Context, queues ...string) {
 	// Start handler worker
 	q.wg.Go(func() {
 		// Unlink original context cancellation to gracefully stop the worker later
 		workerCtx := context.WithoutCancel(ctx)
 
-		q.runHandlerWorker(workerCtx)
+		q.runHandlerWorker(workerCtx, queues)
 	})
 }
 
@@ -470,8 +471,8 @@ func (q *Queue) Stop(ctx context.Context) error {
 	}
 }
 
-// runHandlerWorker starts a worker to process the jobs.
-func (q *Queue) runHandlerWorker(ctx context.Context) {
+// runHandlerWorker starts a worker to process the jobs for the specified queues.
+func (q *Queue) runHandlerWorker(ctx context.Context, queues []string) {
 	ticker := time.NewTicker(q.config.Poll.PollInterval)
 	defer ticker.Stop()
 
@@ -485,7 +486,7 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			for {
-				fetched := q.processJobs(ctx)
+				fetched := q.processJobs(ctx, queues)
 				if fetched == 0 {
 					break // no more jobs, wait for the next timer tick
 				}
@@ -502,10 +503,11 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 	}
 }
 
-// processJobs fetches batch of jobs from db and routes them to handlers. Returns a total count of fetched jobs.
-func (q *Queue) processJobs(ctx context.Context) int {
+// processJobs fetches batch of jobs for the specified queues from db and routes them to handlers.
+// Returns total count of fetched jobs.
+func (q *Queue) processJobs(ctx context.Context, queues []string) int {
 	// Fetch jobs from db first
-	jobs, err := q.fetchJobs(ctx)
+	jobs, err := q.fetchJobs(ctx, queues)
 	if err != nil {
 		log.Printf("[PQueue][ERROR] Failed to fetch jobs: %v", err)
 
@@ -541,12 +543,12 @@ func (q *Queue) processJobs(ctx context.Context) int {
 	return len(jobs)
 }
 
-// fetchJobs fetches batch of jobs from db.
-func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
+// fetchJobs fetches batch of jobs from db for the specified queues.
+func (q *Queue) fetchJobs(ctx context.Context, queues []string) ([]Job, error) {
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	jobs, err := q.storage.ListActiveJobs(ctx, q.config.Poll.BatchSize)
+	jobs, err := q.storage.ListActiveJobs(ctx, queues, q.config.Poll.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("list active jobs from storage: %w", err)
 	}

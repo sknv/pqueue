@@ -56,14 +56,22 @@ BEFORE UPDATE ON pqueue_jobs
 FOR EACH ROW
 EXECUTE FUNCTION pqueue_set_updated_at();
 
--- Основной индекс для получения задач на выполнение
+-- Основные индексы для получения задач на выполнение
 CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__pending_worker
 ON pqueue_jobs (priority DESC, scheduled_at)
 WHERE status = 'pending';
 
--- Индекс для получения зависших задач
+CREATE INDEX idx__pqueue_jobs__pending_queue_worker
+ON pqueue_jobs (queue, priority DESC, scheduled_at)
+WHERE status = 'pending';
+
+-- Индексы для получения зависших задач
 CREATE INDEX IF NOT EXISTS idx__pqueue_jobs__stuck_worker
 ON pqueue_jobs (stuck_at)
+WHERE status = 'running';
+
+CREATE INDEX idx__pqueue_jobs__stuck_queue_worker
+ON pqueue_jobs (queue, stuck_at)
 WHERE status = 'running';
 
 -- Индекс для очистки завершенных задач

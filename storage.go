@@ -24,7 +24,7 @@ type Storage interface {
 		jobs []PreparedBatchJob,
 	) ([]*Job, error)
 
-	ListActiveJobs(ctx context.Context, batchSize uint) ([]Job, error)
+	ListActiveJobs(ctx context.Context, queues []string, batchSize uint) ([]Job, error)
 
 	CompleteJob(ctx context.Context, id uuid.UUID) error
 	ReScheduleJob(ctx context.Context, id uuid.UUID, scheduledAt time.Time, errorMessage string) error
