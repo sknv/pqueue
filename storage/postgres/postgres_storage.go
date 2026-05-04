@@ -38,22 +38,23 @@ const _insertJobSQL = `
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	ON CONFLICT (idempotency_key) DO UPDATE
 	SET id = pqueue_jobs.id
-	RETURNING id,
-	          idempotency_key,
-	          queue,
-	          payload,
-	          status,
-	          priority,
-	          attempts,
-	          max_attempts,
-	          stuck_timeout_millis,
-	          scheduled_at,
-	          run_at,
-	          stuck_at,
-	          completed_at,
-	          error_message,
-	          created_at,
-	          updated_at
+	RETURNING
+	  id,
+	  idempotency_key,
+	  queue,
+	  payload,
+	  status,
+	  priority,
+	  attempts,
+	  max_attempts,
+	  stuck_timeout_millis,
+	  scheduled_at,
+	  run_at,
+	  stuck_at,
+	  completed_at,
+	  error_message,
+	  created_at,
+	  updated_at
 `
 
 // InsertJob inserts a new job into storage.
@@ -106,6 +107,8 @@ func (s *Storage) InsertJob(
 }
 
 // InsertBatchJobs inserts a batch of jobs into storage.
+//
+//nolint:funlen // linear logic
 func (s *Storage) InsertBatchJobs(
 	ctx context.Context,
 	batcher pqueue.BatchSender,
@@ -209,27 +212,109 @@ const _fetchJobsSQL = `
 	    stuck_at = now() + (stuck_timeout_millis * interval '1 millisecond')
 	FROM candidates
 	WHERE j.id = candidates.id
-	RETURNING j.id,
-	          j.idempotency_key,
-	          j.queue,
-	          j.payload,
-	          j.status,
-	          j.priority,
-	          j.attempts,
-	          j.max_attempts,
-	          j.stuck_timeout_millis,
-	          j.scheduled_at,
-	          j.run_at,
-	          j.stuck_at,
-	          j.completed_at,
-	          j.error_message,
-	          j.created_at,
-	          j.updated_at
+	RETURNING
+	  j.id,
+	  j.idempotency_key,
+	  j.queue,
+	  j.payload,
+	  j.status,
+	  j.priority,
+	  j.attempts,
+	  j.max_attempts,
+	  j.stuck_timeout_millis,
+	  j.scheduled_at,
+	  j.run_at,
+	  j.stuck_at,
+	  j.completed_at,
+	  j.error_message,
+	  j.created_at,
+	  j.updated_at
 `
 
-// ListActiveJobs fetches a batch of active jobs from storage.
-func (s *Storage) ListActiveJobs(ctx context.Context, batchSize uint) ([]pqueue.Job, error) {
-	rows, err := s.db.Query(ctx, _fetchJobsSQL, pqueue.JobStatusPending, pqueue.JobStatusRunning, batchSize)
+const _fetchJobsWithQueuesSQL = `
+	WITH pre_candidates AS (
+	  (
+	    SELECT id, priority, scheduled_at
+	    FROM pqueue_jobs
+	    WHERE queue = ANY($1)
+		  AND status = $2
+	      AND scheduled_at <= now()
+	    ORDER BY priority DESC, scheduled_at
+	    LIMIT $4
+	  )
+	  UNION ALL
+	  (
+	    SELECT id, priority, scheduled_at
+	    FROM pqueue_jobs
+	    WHERE queue = ANY($1)
+		  AND status = $3
+	      AND stuck_at <= now()
+	    ORDER BY priority DESC, scheduled_at
+	    LIMIT $4
+	  )
+	),
+	candidates AS (
+	  SELECT id
+	  FROM pre_candidates
+	  ORDER BY priority DESC, scheduled_at
+	  LIMIT $4
+	  FOR NO KEY UPDATE SKIP LOCKED
+	)
+
+	UPDATE pqueue_jobs AS j
+	SET status = $3,
+	    attempts = attempts + 1,
+	    run_at = now(),
+	    stuck_at = now() + (stuck_timeout_millis * interval '1 millisecond')
+	FROM candidates
+	WHERE j.id = candidates.id
+	RETURNING
+	  j.id,
+	  j.idempotency_key,
+	  j.queue,
+	  j.payload,
+	  j.status,
+	  j.priority,
+	  j.attempts,
+	  j.max_attempts,
+	  j.stuck_timeout_millis,
+	  j.scheduled_at,
+	  j.run_at,
+	  j.stuck_at,
+	  j.completed_at,
+	  j.error_message,
+	  j.created_at,
+	  j.updated_at
+`
+
+// ListActiveJobs fetches a batch of active jobs from storage for the specified queues.
+// If no queues specified jobs for all queues will be fetched.
+//
+//nolint:funlen // linear logic
+func (s *Storage) ListActiveJobs(ctx context.Context, queues []string, batchSize uint) ([]pqueue.Job, error) {
+	var (
+		sql  string
+		args []any
+	)
+
+	if len(queues) > 0 {
+		sql = _fetchJobsWithQueuesSQL
+		args = []any{
+			queues,
+			pqueue.JobStatusPending,
+			pqueue.JobStatusRunning,
+			batchSize,
+		}
+	} else {
+		sql = _fetchJobsSQL
+		args = []any{
+			pqueue.JobStatusPending,
+			pqueue.JobStatusRunning,
+			batchSize,
+		}
+	}
+
+	rows, err := s.db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
 	}

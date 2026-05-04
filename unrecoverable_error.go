@@ -7,6 +7,7 @@ type unrecoverableError struct {
 	error
 }
 
+// Error returns an error message.
 func (e unrecoverableError) Error() string {
 	if e.error == nil {
 		return "unrecoverable error"

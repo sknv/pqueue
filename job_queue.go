@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -439,13 +439,14 @@ func (q *Queue) Decoder() Decoder {
 }
 
 // Start begins processing jobs.
-func (q *Queue) Start(ctx context.Context) {
+// If optional queues argument provided worker will process only specified queues.
+func (q *Queue) Start(ctx context.Context, queues ...string) {
 	// Start handler worker
 	q.wg.Go(func() {
 		// Unlink original context cancellation to gracefully stop the worker later
 		workerCtx := context.WithoutCancel(ctx)
 
-		q.runHandlerWorker(workerCtx)
+		q.runHandlerWorker(workerCtx, queues)
 	})
 }
 
@@ -470,8 +471,8 @@ func (q *Queue) Stop(ctx context.Context) error {
 	}
 }
 
-// runHandlerWorker starts a worker to process the jobs.
-func (q *Queue) runHandlerWorker(ctx context.Context) {
+// runHandlerWorker starts a worker to process the jobs for the specified queues.
+func (q *Queue) runHandlerWorker(ctx context.Context, queues []string) {
 	ticker := time.NewTicker(q.config.Poll.PollInterval)
 	defer ticker.Stop()
 
@@ -485,7 +486,7 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 			return
 		case <-ticker.C:
 			for {
-				fetched := q.processJobs(ctx)
+				fetched := q.processJobs(ctx, queues)
 				if fetched == 0 {
 					break // no more jobs, wait for the next timer tick
 				}
@@ -502,12 +503,16 @@ func (q *Queue) runHandlerWorker(ctx context.Context) {
 	}
 }
 
-// processJobs fetches batch of jobs from db and routes them to handlers. Returns a total count of fetched jobs.
-func (q *Queue) processJobs(ctx context.Context) int {
+// processJobs fetches batch of jobs for the specified queues from db and routes them to handlers.
+// Returns total count of fetched jobs.
+func (q *Queue) processJobs(ctx context.Context, queues []string) int {
 	// Fetch jobs from db first
-	jobs, err := q.fetchJobs(ctx)
+	jobs, err := q.fetchJobs(ctx, queues)
 	if err != nil {
-		log.Printf("[PQueue][ERROR] Failed to fetch jobs: %v", err)
+		slog.LogAttrs(ctx, slog.LevelError, "Failed to fetch jobs",
+			slog.String("component", "pqueue"),
+			slog.String("error", err.Error()),
+		)
 
 		return 0
 	}
@@ -525,7 +530,11 @@ func (q *Queue) processJobs(ctx context.Context) int {
 			job := &jobs[i]
 
 			if jobErr := q.handleJob(ctx, job); jobErr != nil {
-				log.Printf("[PQueue][ERROR] Failed to handle job with id '%s': %v", job.ID, jobErr)
+				slog.LogAttrs(ctx, slog.LevelError, "Failed to handle a job",
+					slog.String("component", "pqueue"),
+					slog.String("job_id", job.ID.String()),
+					slog.String("error", jobErr.Error()),
+				)
 			}
 
 			return nil
@@ -533,7 +542,10 @@ func (q *Queue) processJobs(ctx context.Context) int {
 	}
 
 	if err = gr.Wait(); err != nil {
-		log.Printf("[PQueue][ERROR] Failed to wait for all jobs to complete: %v", err)
+		slog.LogAttrs(ctx, slog.LevelError, "Failed to wait for all jobs to complete",
+			slog.String("component", "pqueue"),
+			slog.String("error", err.Error()),
+		)
 
 		return 0
 	}
@@ -541,12 +553,12 @@ func (q *Queue) processJobs(ctx context.Context) int {
 	return len(jobs)
 }
 
-// fetchJobs fetches batch of jobs from db.
-func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
+// fetchJobs fetches batch of jobs from db for the specified queues.
+func (q *Queue) fetchJobs(ctx context.Context, queues []string) ([]Job, error) {
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	jobs, err := q.storage.ListActiveJobs(ctx, q.config.Poll.BatchSize)
+	jobs, err := q.storage.ListActiveJobs(ctx, queues, q.config.Poll.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("list active jobs from storage: %w", err)
 	}
@@ -559,10 +571,10 @@ func (q *Queue) fetchJobs(ctx context.Context) ([]Job, error) {
 func (q *Queue) handleJob(ctx context.Context, job *Job) error {
 	handler, exists := q.handlers[job.Queue]
 	if !exists {
-		log.Printf(
-			"[PQueue][ERROR] No handler registered for queue '%s', job '%s' will be rescheduled",
-			job.Queue,
-			job.ID,
+		slog.LogAttrs(ctx, slog.LevelError, "No handler registered for the queue, a job will be rescheduled",
+			slog.String("component", "pqueue"),
+			slog.String("queue", job.Queue),
+			slog.String("job_id", job.ID.String()),
 		)
 
 		// Use a blank handler so handleJobError falls back to the configured default backoff.
@@ -646,7 +658,9 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 		return nil
 	}
 
-	log.Printf("[PQueue][INFO] Running cold jobs cleaner...")
+	slog.LogAttrs(ctx, slog.LevelInfo, "Running cold jobs cleaner...",
+		slog.String("component", "pqueue"),
+	)
 
 	ctx, cancel := context.WithTimeout(ctx, q.config.ColdCleanup.DbTimeout)
 	defer cancel()
@@ -659,12 +673,17 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 	}
 
 	if rowsAffected == 0 {
-		log.Printf("[PQueue][INFO] No cold jobs to be cleaned up")
+		slog.LogAttrs(ctx, slog.LevelInfo, "No cold jobs to be cleaned up",
+			slog.String("component", "pqueue"),
+		)
 
 		return nil
 	}
 
-	log.Printf("[PQueue][INFO] Cleaned up %d cold jobs", rowsAffected)
+	slog.LogAttrs(ctx, slog.LevelInfo, "Cleaned up cold jobs",
+		slog.String("component", "pqueue"),
+		slog.Uint64("deleted_job_count", uint64(rowsAffected)),
+	)
 
 	return nil
 }
@@ -678,7 +697,9 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 		return nil
 	}
 
-	log.Printf("[PQueue][INFO] Running dead jobs cleaner...")
+	slog.LogAttrs(ctx, slog.LevelInfo, "Running dead jobs cleaner...",
+		slog.String("component", "pqueue"),
+	)
 
 	ctx, cancel := context.WithTimeout(ctx, q.config.DeadCleanup.DbTimeout)
 	defer cancel()
@@ -691,12 +712,17 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 	}
 
 	if rowsAffected == 0 {
-		log.Printf("[PQueue][INFO] No dead jobs to be cleaned up")
+		slog.LogAttrs(ctx, slog.LevelInfo, "No dead jobs to be cleaned up",
+			slog.String("component", "pqueue"),
+		)
 
 		return nil
 	}
 
-	log.Printf("[PQueue][INFO] Cleaned up %d dead jobs", rowsAffected)
+	slog.LogAttrs(ctx, slog.LevelInfo, "Cleaned up dead jobs",
+		slog.String("component", "pqueue"),
+		slog.Uint64("deleted_job_count", uint64(rowsAffected)),
+	)
 
 	return nil
 }

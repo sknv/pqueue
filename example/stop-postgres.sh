@@ -1,2 +1,2 @@
 docker stop my-postgres
-docker rm my-postgres
+docker rm -v my-postgres
