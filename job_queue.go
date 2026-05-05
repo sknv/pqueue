@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/sync/errgroup"
 )
 
 //
@@ -450,7 +449,8 @@ func (q *Queue) Start(ctx context.Context, queues ...string) {
 	})
 }
 
-// Stop gracefully stops the queue.
+// Stop signals the worker to stop and waits until it finishes or the context expires.
+// It waits for the polling loop AND all in-flight job goroutines to complete.
 func (q *Queue) Stop(ctx context.Context) error {
 	close(q.stopped) // stop signal
 
@@ -471,8 +471,19 @@ func (q *Queue) Stop(ctx context.Context) error {
 	}
 }
 
-// runHandlerWorker starts a worker to process the jobs for the specified queues.
+// runHandlerWorker is the main polling loop. It maintains a semaphore of size Concurrency.
+//
+// On every tick it checks how many slots are free and fetches up to that many jobs
+// (capped at BatchSize). Each job is dispatched to its own goroutine immediately;
+// the goroutine releases its slot when done so the next tick can fill it again.
+//
+// This means a slow job never blocks faster ones from being picked up: as soon as any
+// goroutine finishes, its slot becomes available for new work on the very next poll.
 func (q *Queue) runHandlerWorker(ctx context.Context, queues []string) {
+	// sem is a counting semaphore. Sending acquires a slot; receiving releases it.
+	// Its capacity is the maximum number of concurrently running job goroutines.
+	sem := make(chan struct{}, q.config.Poll.Concurrency)
+
 	ticker := time.NewTicker(q.config.Poll.PollInterval)
 	defer ticker.Stop()
 
@@ -482,17 +493,62 @@ func (q *Queue) runHandlerWorker(ctx context.Context, queues []string) {
 			// Force stop (should never happen though)
 			return
 		case <-q.stopped:
-			// Graceful stop
+			// Graceful stop — in-flight goroutines are tracked by w.wg and will be
+			// awaited by Stop() after this function returns.
 			return
 		case <-ticker.C:
+			// Keep fetching as long as there are free slots and pending work.
 			for {
-				fetched := q.processJobs(ctx, queues)
-				if fetched == 0 {
-					break // no more jobs, wait for the next timer tick
+				// How many goroutine slots are currently available?
+				freeSlots := cap(sem) - len(sem)
+				if freeSlots == 0 {
+					break // all slots busy; wait for the next tick
 				}
 
-				// There are more jobs to process, handle them immediately.
-				// But first check if the worker has been stopped during processing.
+				// Fetch only as many jobs as we have room for, up to BatchSize.
+				fetchSize := min(uint(freeSlots), q.config.Poll.BatchSize)
+
+				jobs, err := q.fetchJobs(ctx, queues, fetchSize)
+				if err != nil {
+					slog.LogAttrs(ctx, slog.LevelError, "Failed to fetch jobs",
+						slog.String("component", "floww"),
+						slog.String("error", err.Error()),
+					)
+
+					break
+				}
+
+				if len(jobs) == 0 {
+					break // queue is empty; wait for the next tick
+				}
+
+				// Dispatch each job to its own goroutine immediately.
+				// We already verified there are enough free slots, so the send won't block.
+				for i := range jobs {
+					sem <- struct{}{} // acquire slot
+
+					job := &jobs[i]
+
+					q.wg.Go(func() {
+						defer func() { <-sem }() // release slot when done
+
+						if jobErr := q.handleJob(ctx, job); jobErr != nil {
+							slog.LogAttrs(ctx, slog.LevelError, "Failed to handle a job",
+								slog.String("component", "floww"),
+								slog.String("job_id", job.ID.String()),
+								slog.String("error", jobErr.Error()),
+							)
+						}
+					})
+				}
+
+				// If the storage returned fewer jobs than we asked for, the queue is
+				// drained for now — no point querying again this tick.
+				if len(jobs) < int(fetchSize) {
+					break
+				}
+
+				// Full batch received: loop immediately to fill any remaining free slots.
 				select {
 				case <-q.stopped:
 					return
@@ -503,62 +559,16 @@ func (q *Queue) runHandlerWorker(ctx context.Context, queues []string) {
 	}
 }
 
-// processJobs fetches batch of jobs for the specified queues from db and routes them to handlers.
-// Returns total count of fetched jobs.
-func (q *Queue) processJobs(ctx context.Context, queues []string) int {
-	// Fetch jobs from db first
-	jobs, err := q.fetchJobs(ctx, queues)
-	if err != nil {
-		slog.LogAttrs(ctx, slog.LevelError, "Failed to fetch jobs",
-			slog.String("component", "pqueue"),
-			slog.String("error", err.Error()),
-		)
-
-		return 0
-	}
-
-	if len(jobs) == 0 {
-		return 0
-	}
-
-	// Process jobs concurrently respecting concurrency limit
-	gr := errgroup.Group{}
-	gr.SetLimit(q.config.Poll.Concurrency)
-
-	for i := range jobs {
-		gr.Go(func() error {
-			job := &jobs[i]
-
-			if jobErr := q.handleJob(ctx, job); jobErr != nil {
-				slog.LogAttrs(ctx, slog.LevelError, "Failed to handle a job",
-					slog.String("component", "pqueue"),
-					slog.String("job_id", job.ID.String()),
-					slog.String("error", jobErr.Error()),
-				)
-			}
-
-			return nil
-		})
-	}
-
-	if err = gr.Wait(); err != nil {
-		slog.LogAttrs(ctx, slog.LevelError, "Failed to wait for all jobs to complete",
-			slog.String("component", "pqueue"),
-			slog.String("error", err.Error()),
-		)
-
-		return 0
-	}
-
-	return len(jobs)
-}
-
-// fetchJobs fetches batch of jobs from db for the specified queues.
-func (q *Queue) fetchJobs(ctx context.Context, queues []string) ([]Job, error) {
+// fetchJobs fetches up to fetchSize jobs from storage.
+func (q *Queue) fetchJobs(
+	ctx context.Context,
+	queues []string,
+	fetchSize uint,
+) ([]Job, error) {
 	ctx, cancel := context.WithTimeout(ctx, q.config.Processing.DbTimeout)
 	defer cancel()
 
-	jobs, err := q.storage.ListActiveJobs(ctx, queues, q.config.Poll.BatchSize)
+	jobs, err := q.storage.ListActiveJobs(ctx, queues, fetchSize)
 	if err != nil {
 		return nil, fmt.Errorf("list active jobs from storage: %w", err)
 	}
