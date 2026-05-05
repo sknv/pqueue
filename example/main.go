@@ -127,7 +127,7 @@ func HandleEmailJob(decode pqueue.Decoder) pqueue.JobHandler {
 			job.ID, payload.To, payload.Subject)
 
 		// Simulate email sending
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(time.Duration(rand.IntN(5_000)+100) * time.Millisecond)
 
 		// Simulate occasional failures for testing retry logic
 		if rand.N(3)%3 == 0 {
