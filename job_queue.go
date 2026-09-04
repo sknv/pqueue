@@ -7,8 +7,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 //
@@ -32,7 +31,6 @@ const (
 // Job represents a job in the queue.
 type Job struct {
 	ID                 uuid.UUID
-	IdempotencyKey     uuid.UUID
 	Queue              string
 	Payload            []byte
 	Status             JobStatus
@@ -51,6 +49,8 @@ type Job struct {
 
 // JobOptions holds the resolved options for a job.
 type JobOptions struct {
+	id           uuid.UUID
+	isIdempotent bool
 	priority     int
 	maxAttempts  uint
 	stuckTimeout time.Duration
@@ -61,11 +61,18 @@ type JobOptions struct {
 func defaultJobOptions() JobOptions {
 	//nolint:mnd // default values
 	return JobOptions{
+		id:           uuid.NewV7(),
 		priority:     0,
 		maxAttempts:  1,
 		stuckTimeout: time.Minute * 5,
 		scheduledAt:  time.Now(),
 	}
+}
+
+// IsIdempotent returns true when the job should be enqueued idempotently,
+// i.e. via the check-then-insert path that deduplicates on id.
+func (o JobOptions) IsIdempotent() bool {
+	return o.isIdempotent
 }
 
 // Priority returns job priority.
@@ -90,6 +97,16 @@ func (o JobOptions) ScheduledAt() time.Time {
 
 // JobOption is a function to configure job options.
 type JobOption func(*JobOptions)
+
+// WithJobID sets a custom job id and enables idempotent enqueueing.
+// Re-enqueueing a job with the same id returns the existing row without modification.
+// If not provided, a uuid v7 is auto-generated and the fast (non-idempotent) insert path is used.
+func WithJobID(id uuid.UUID) JobOption {
+	return func(o *JobOptions) {
+		o.id = id
+		o.isIdempotent = true
+	}
+}
 
 // WithJobPriority sets the job priority.
 func WithJobPriority(priority int) JobOption {
@@ -137,6 +154,8 @@ type jobHandlerWrapper struct {
 	backoffCalculator BackoffCalculator
 }
 
+// calculateBackoff returns the custom backoff duration if a calculator is
+// configured, otherwise falls back to the provided default.
 func (h *jobHandlerWrapper) calculateBackoff(attempt uint, defaultBackoff time.Duration) time.Duration {
 	if h.backoffCalculator == nil {
 		return defaultBackoff
@@ -160,8 +179,8 @@ func WithJobHandlerBackoffCalculator(backoffCalculator BackoffCalculator) JobHan
 //
 
 type (
-	// PollConfig configures the poller loop.
-	PollConfig struct {
+	// PollingConfig configures the poller loop.
+	PollingConfig struct {
 		BatchSize    uint          // number of jobs to claim per poll
 		Concurrency  int           // max in-flight jobs
 		PollInterval time.Duration // sleep when no jobs claimed
@@ -173,19 +192,24 @@ type (
 		DefaultBackoff time.Duration // default job backoff
 	}
 
-	// CleanupConfig configures cold and dead jobs cleaning process.
-	CleanupConfig struct {
+	// PartitioningConfig configures partition pre-creation.
+	PartitioningConfig struct {
+		ForwardWeeks int // how many future weeks to pre-create partitions for
+	}
+
+	// PartitionCleanupConfig configures partition-based cleanup of old jobs.
+	PartitionCleanupConfig struct {
 		DbTimeout         time.Duration // database timeout for background operations
-		RetentionInterval time.Duration // time to keep jobs in storage
-		CleanupBatchSize  uint          // how many records should we delete at once
+		RetentionInterval time.Duration // time to keep jobs before dropping their partitions
 	}
 
 	// QueueConfig holds configuration for the job queue.
 	QueueConfig struct {
-		Poll        PollConfig
-		Processing  ProcessingConfig
-		ColdCleanup CleanupConfig
-		DeadCleanup CleanupConfig
+		Polling      PollingConfig
+		Processing   ProcessingConfig
+		Partitioning PartitioningConfig
+		ColdCleanup  PartitionCleanupConfig
+		DeadCleanup  PartitionCleanupConfig
 	}
 )
 
@@ -193,7 +217,7 @@ type (
 func DefaultConfig() *QueueConfig {
 	//nolint:mnd // default values
 	return &QueueConfig{
-		Poll: PollConfig{
+		Polling: PollingConfig{
 			BatchSize:    10,
 			Concurrency:  10,
 			PollInterval: time.Second,
@@ -202,15 +226,16 @@ func DefaultConfig() *QueueConfig {
 			DbTimeout:      time.Second * 10,
 			DefaultBackoff: time.Second * 30,
 		},
-		ColdCleanup: CleanupConfig{
+		Partitioning: PartitioningConfig{
+			ForwardWeeks: 4,
+		},
+		ColdCleanup: PartitionCleanupConfig{
 			DbTimeout:         time.Second * 30,
 			RetentionInterval: time.Hour * 24 * 7,
-			CleanupBatchSize:  10_000,
 		},
-		DeadCleanup: CleanupConfig{
+		DeadCleanup: PartitionCleanupConfig{
 			DbTimeout:         time.Second * 30,
 			RetentionInterval: time.Hour * 24 * 90,
-			CleanupBatchSize:  10_000,
 		},
 	}
 }
@@ -282,7 +307,6 @@ func (q *Queue) Enqueue(
 	ctx context.Context,
 	queryer QueryRower,
 	queue string,
-	idempotencyKey uuid.UUID,
 	payload any,
 	opts ...JobOption,
 ) (*Job, error) {
@@ -301,8 +325,6 @@ func (q *Queue) Enqueue(
 		}
 	}
 
-	id := uuid.Must(uuid.NewV7())
-
 	options := defaultJobOptions()
 	for _, opt := range opts {
 		opt(&options)
@@ -311,8 +333,7 @@ func (q *Queue) Enqueue(
 	job, err := q.storage.InsertJob(
 		ctx,
 		queryer,
-		id,
-		idempotencyKey,
+		options.id,
 		queue,
 		payloadBytes,
 		options,
@@ -326,10 +347,9 @@ func (q *Queue) Enqueue(
 
 // BatchJob describes a single job to be enqueued as part of a batch.
 type BatchJob struct {
-	Queue          string
-	IdempotencyKey uuid.UUID
-	Payload        any
-	Opts           []JobOption
+	Queue   string
+	Payload any
+	Opts    []JobOption
 }
 
 // EnqueueBatch inserts all provided jobs in a single database round-trip.
@@ -361,21 +381,15 @@ func (q *Queue) EnqueueBatch(
 // PreparedBatchJob is an internal representation of a batch job with its payload
 // already encoded and options resolved. It is passed to Storage.InsertBatchJobs.
 type PreparedBatchJob struct {
-	id             uuid.UUID
-	idempotencyKey uuid.UUID
-	queue          string
-	payload        []byte
-	options        JobOptions
+	id      uuid.UUID
+	queue   string
+	payload []byte
+	options JobOptions
 }
 
 // ID returns an id of a prepared job.
 func (j PreparedBatchJob) ID() uuid.UUID {
 	return j.id
-}
-
-// IdempotencyKey returns an idempotency key of a prepared job.
-func (j PreparedBatchJob) IdempotencyKey() uuid.UUID {
-	return j.idempotencyKey
 }
 
 // Queue returns a queue of a prepared job.
@@ -399,7 +413,7 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
 	prepared := make([]PreparedBatchJob, len(jobs))
 	for i, batchJob := range jobs {
 		if batchJob.Queue == "" {
-			return nil, fmt.Errorf("job with idempotency key %s: queue name must not be empty", batchJob.IdempotencyKey)
+			return nil, fmt.Errorf("job at index %d: queue name must not be empty", i)
 		}
 
 		var payloadBytes []byte
@@ -409,11 +423,9 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
 
 			payloadBytes, err = q.encoder.Encode(batchJob.Payload)
 			if err != nil {
-				return nil, fmt.Errorf("job with idempotency key %s: encode payload: %w", batchJob.IdempotencyKey, err)
+				return nil, fmt.Errorf("job at index %d: encode payload: %w", i, err)
 			}
 		}
-
-		id := uuid.Must(uuid.NewV7())
 
 		options := defaultJobOptions()
 		for _, opt := range batchJob.Opts {
@@ -421,11 +433,10 @@ func (q *Queue) prepareBatchJobs(jobs []BatchJob) ([]PreparedBatchJob, error) {
 		}
 
 		prepared[i] = PreparedBatchJob{
-			id:             id,
-			idempotencyKey: batchJob.IdempotencyKey,
-			queue:          batchJob.Queue,
-			payload:        payloadBytes,
-			options:        options,
+			id:      options.id,
+			queue:   batchJob.Queue,
+			payload: payloadBytes,
+			options: options,
 		}
 	}
 
@@ -482,9 +493,9 @@ func (q *Queue) Stop(ctx context.Context) error {
 func (q *Queue) runHandlerWorker(ctx context.Context, queues []string) {
 	// sem is a counting semaphore. Sending acquires a slot; receiving releases it.
 	// Its capacity is the maximum number of concurrently running job goroutines.
-	sem := make(chan struct{}, q.config.Poll.Concurrency)
+	sem := make(chan struct{}, q.config.Polling.Concurrency)
 
-	ticker := time.NewTicker(q.config.Poll.PollInterval)
+	ticker := time.NewTicker(q.config.Polling.PollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -530,7 +541,7 @@ func (q *Queue) processJobs(
 	}
 
 	// Fetch only as many jobs as we have room for, up to BatchSize.
-	fetchSize := min(freeSlots, q.config.Poll.BatchSize)
+	fetchSize := min(freeSlots, q.config.Polling.BatchSize)
 
 	jobs, err := q.fetchJobs(ctx, queues, fetchSize)
 	if err != nil {
@@ -549,12 +560,12 @@ func (q *Queue) processJobs(
 	// Dispatch each job to its own goroutine immediately.
 	// We already verified there are enough free slots, so the send won't block.
 	for i := range jobs {
-		sem <- struct{}{} // acquire slot
+		sem <- struct{}{} // acquire a slot
 
 		job := &jobs[i]
 
 		q.wg.Go(func() {
-			defer func() { <-sem }() // release slot when done
+			defer func() { <-sem }() // release a slot when done
 
 			if jobErr := q.handleJob(ctx, job); jobErr != nil {
 				slog.LogAttrs(ctx, slog.LevelError, "Failed to handle a job",
@@ -671,16 +682,41 @@ func (q *Queue) failJob(ctx context.Context, job *Job, handleErr error) error {
 	return nil
 }
 
-// CleanColdJobs removes completed jobs.
+// CreatePartitions pre-creates weekly partitions for the current week plus
+// the configured number of forward weeks. Call this from a cron job or a
+// periodic goroutine to ensure future partitions always exist.
+func (q *Queue) CreatePartitions(ctx context.Context) error {
+	slog.LogAttrs(ctx, slog.LevelInfo, "Creating weekly partitions...",
+		slog.String("component", "pqueue"),
+		slog.Int("forward_weeks", q.config.Partitioning.ForwardWeeks),
+	)
+
+	ctx, cancel := context.WithTimeout(ctx, q.config.ColdCleanup.DbTimeout)
+	defer cancel()
+
+	if err := q.storage.CreatePartitions(ctx, uint(q.config.Partitioning.ForwardWeeks)); err != nil {
+		return fmt.Errorf("create partitions in storage: %w", err)
+	}
+
+	slog.LogAttrs(ctx, slog.LevelInfo, "Weekly partitions created successfully",
+		slog.String("component", "pqueue"),
+	)
+
+	return nil
+}
+
+// DropOldColdPartitions drops all completed-jobs weekly partitions older than
+// the configured retention interval. This is an O(1) operation per partition
+// (DROP TABLE) compared to row-by-row deletion.
 //
 // Most of the times the function should be called from some sort of a cron job.
-func (q *Queue) CleanColdJobs(ctx context.Context) error {
+func (q *Queue) DropOldColdPartitions(ctx context.Context) error {
 	// Keep jobs if there is no retention
 	if q.config.ColdCleanup.RetentionInterval <= 0 {
 		return nil
 	}
 
-	slog.LogAttrs(ctx, slog.LevelInfo, "Running cold jobs cleaner...",
+	slog.LogAttrs(ctx, slog.LevelInfo, "Dropping old cold job partitions...",
 		slog.String("component", "pqueue"),
 	)
 
@@ -689,37 +725,39 @@ func (q *Queue) CleanColdJobs(ctx context.Context) error {
 
 	cutoffDate := time.Now().Add(-q.config.ColdCleanup.RetentionInterval)
 
-	rowsAffected, err := q.storage.DeleteColdJobs(ctx, cutoffDate, q.config.ColdCleanup.CleanupBatchSize)
+	dropped, err := q.storage.DropOldColdPartitions(ctx, cutoffDate)
 	if err != nil {
-		return fmt.Errorf("delete cold jobs from storage: %w", err)
+		return fmt.Errorf("drop old cold partitions from storage: %w", err)
 	}
 
-	if rowsAffected == 0 {
-		slog.LogAttrs(ctx, slog.LevelInfo, "No cold jobs to be cleaned up",
+	if dropped == 0 {
+		slog.LogAttrs(ctx, slog.LevelInfo, "No cold partitions to be dropped",
 			slog.String("component", "pqueue"),
 		)
 
 		return nil
 	}
 
-	slog.LogAttrs(ctx, slog.LevelInfo, "Cold jobs cleaned up successfully",
+	slog.LogAttrs(ctx, slog.LevelInfo, "Old cold partitions dropped successfully",
 		slog.String("component", "pqueue"),
-		slog.Uint64("deleted_job_count", uint64(rowsAffected)),
+		slog.Uint64("dropped_partition_count", uint64(dropped)),
 	)
 
 	return nil
 }
 
-// CleanDeadJobs removes failed jobs.
+// DropOldDeadPartitions drops all failed-jobs weekly partitions older than
+// the configured retention interval. This is an O(1) operation per partition
+// (DROP TABLE) compared to row-by-row deletion.
 //
 // Most of the times the function should be called from some sort of a cron job.
-func (q *Queue) CleanDeadJobs(ctx context.Context) error {
+func (q *Queue) DropOldDeadPartitions(ctx context.Context) error {
 	// Keep jobs if there is no retention
 	if q.config.DeadCleanup.RetentionInterval <= 0 {
 		return nil
 	}
 
-	slog.LogAttrs(ctx, slog.LevelInfo, "Running dead jobs cleaner...",
+	slog.LogAttrs(ctx, slog.LevelInfo, "Dropping old dead job partitions...",
 		slog.String("component", "pqueue"),
 	)
 
@@ -728,22 +766,22 @@ func (q *Queue) CleanDeadJobs(ctx context.Context) error {
 
 	cutoffDate := time.Now().Add(-q.config.DeadCleanup.RetentionInterval)
 
-	rowsAffected, err := q.storage.DeleteDeadJobs(ctx, cutoffDate, q.config.DeadCleanup.CleanupBatchSize)
+	dropped, err := q.storage.DropOldDeadPartitions(ctx, cutoffDate)
 	if err != nil {
-		return fmt.Errorf("delete dead jobs from storage: %w", err)
+		return fmt.Errorf("drop old dead partitions from storage: %w", err)
 	}
 
-	if rowsAffected == 0 {
-		slog.LogAttrs(ctx, slog.LevelInfo, "No dead jobs to be cleaned up",
+	if dropped == 0 {
+		slog.LogAttrs(ctx, slog.LevelInfo, "No dead partitions to be dropped",
 			slog.String("component", "pqueue"),
 		)
 
 		return nil
 	}
 
-	slog.LogAttrs(ctx, slog.LevelInfo, "Dead jobs cleaned up successfully",
+	slog.LogAttrs(ctx, slog.LevelInfo, "Old dead partitions dropped successfully",
 		slog.String("component", "pqueue"),
-		slog.Uint64("deleted_job_count", uint64(rowsAffected)),
+		slog.Uint64("dropped_partition_count", uint64(dropped)),
 	)
 
 	return nil

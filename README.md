@@ -1,6 +1,6 @@
 # pqueue
 
-A lightweight, PostgreSQL-backed priority job queue for Go. Jobs are stored durably in Postgres and processed concurrently by worker goroutines. The queue supports priorities, scheduled execution, automatic retries with configurable backoff, stuck-job recovery, idempotent enqueueing, and periodic cleanup of completed and dead jobs.
+A lightweight, PostgreSQL-backed priority job queue for Go. Jobs are stored durably in Postgres and processed concurrently by worker goroutines. The queue supports priorities, scheduled execution, automatic retries with configurable backoff, stuck-job recovery, batch enqueueing, idempotent enqueueing and partitioned storage with O(1) cleanup via partition drops.
 
 Uses a short-polling mechanism for fetching updates, making it compatible with connection poolers in transaction mode.
 
@@ -10,12 +10,12 @@ Uses a short-polling mechanism for fetching updates, making it compatible with c
 - **Delayed execution** — schedule jobs to run at any future time
 - **Automatic retries** — failed jobs are rescheduled with configurable backoff; exhausted jobs move to a dead-letter state
 - **Stuck-job recovery** — jobs that exceed their timeout are automatically re-queued
-- **Idempotent enqueueing** — duplicate submissions with the same idempotency key are silently deduplicated
 - **Batch enqueueing** — insert many jobs in a single database round-trip, optionally inside a transaction
+- **Idempotent enqueueing** — provide a custom job id via `WithJobID`; re-enqueueing returns the existing job without modification
 - **Configurable concurrency** — control how many jobs run in parallel
 - **Pluggable encoder** — JSON by default; swap in any `Encoder` implementation
 - **Storage interface** — ship with the included Postgres backend or bring your own
-- **Automatic cleanup** — built-in helpers to purge old completed and failed jobs
+- **Partitioned storage** — jobs are split into hot, cold, and dead partitions by status; cold and dead are sub-partitioned by week for instant cleanup
 
 ## Requirements
 
@@ -31,7 +31,7 @@ go get github.com/sknv/pqueue
 
 ## Database Setup
 
-Apply the migration file to your database to create the `pqueue_jobs` table, supporting indexes, and helper trigger:
+Apply the migration file to your database to create the `pqueue_jobs` partitioned table, supporting indexes, helper trigger, and partition management functions:
 
 ```bash
 psql -d your_database -f init_pqueue.up.sql
@@ -39,9 +39,16 @@ psql -d your_database -f init_pqueue.up.sql
 
 The migration creates:
 
-- `pqueue_jobs` table with all job fields
-- Partial indexes optimised for pending, running, completed, and failed queries
+- `pqueue_jobs` table partitioned by `LIST(status)` with all job fields
+- Three top-level partitions: `pqueue_jobs_hot` (pending/running), `pqueue_jobs_cold` (completed), `pqueue_jobs_dead` (failed)
+- `pqueue_jobs_cold` and `pqueue_jobs_dead` are further sub-partitioned by `RANGE(created_at)` into weekly partitions
+- Weekly sub-partitions for the current week plus 4 forward weeks (cold and dead only)
+- `DEFAULT` sub-partitions for cold and dead as a safety net for dates outside created weekly partitions
+- Partial indexes on `pqueue_jobs_hot` optimised for pending and running queries
 - An `updated_at` trigger that keeps the timestamp current automatically
+- `pqueue_create_weekly_partitions(forward_weeks)` — pre-creates future weekly partitions (cold and dead)
+- `pqueue_drop_old_partitions(group_name, cutoff_date)` — drops old weekly partitions by group (cold or dead)
+- `pqueue_enqueue_idempotent_job(...)` — idempotent insert: returns the existing row if a job with the same id already exists in any partition; used automatically when `WithJobID` is provided
 
 ## Quick Start
 
@@ -52,11 +59,19 @@ Take a look in the `example` folder.
 ### Single job
 
 ```go
-job, err := q.Enqueue(ctx, db, "my-queue", idempotencyKey, payload,
+job, err := q.Enqueue(ctx, db, "my-queue", payload,
     pqueue.WithJobPriority(10),
     pqueue.WithJobMaxAttempts(5),
     pqueue.WithJobStuckTimeout(2*time.Minute),
     pqueue.WithJobScheduledAt(time.Now().Add(1*time.Hour)),
+)
+```
+
+Use `WithJobID` to provide a custom job id and enable idempotent enqueueing. Re-enqueueing a job with the same id returns the existing row without modification, regardless of its current status. Without `WithJobID`, a uuid v7 is auto-generated and the fast (non-idempotent) insert path is used:
+
+```go
+job, err := q.Enqueue(ctx, db, "my-queue", payload,
+    pqueue.WithJobID(id),
 )
 ```
 
@@ -65,17 +80,15 @@ job, err := q.Enqueue(ctx, db, "my-queue", idempotencyKey, payload,
 ```go
 jobs, err := q.EnqueueBatch(ctx, db, []pqueue.BatchJob{
     {
-        Queue:          "emails",
-        IdempotencyKey: uuid.New(),
-        Payload:        emailPayload,
+        Queue:   "emails",
+        Payload: emailPayload,
         Opts: []pqueue.JobOption{
             pqueue.WithJobPriority(5),
         },
     },
     {
-        Queue:          "notifications",
-        IdempotencyKey: uuid.New(),
-        Payload:        notifPayload,
+        Queue:   "notifications",
+        Payload: notifPayload,
     },
 })
 ```
@@ -86,6 +99,7 @@ Pass a `pgx.Batch` as the `batcher` argument to make the entire batch atomic wit
 
 | Option | Default | Description |
 |---|---|---|
+| `WithJobID(id)` | auto-generated uuid v7 | Custom job id; enables idempotent enqueueing |
 | `WithJobPriority(n)` | `0` | Higher values are processed first |
 | `WithJobMaxAttempts(n)` | `1` | Total attempts before the job is marked failed |
 | `WithJobStuckTimeout(d)` | `5m` | How long a running job may be silent before it is re-queued |
@@ -151,15 +165,16 @@ cfg := &pqueue.QueueConfig{
         DbTimeout:      10 * time.Second,
         DefaultBackoff: 30 * time.Second,
     },
-    ColdCleanup: pqueue.CleanupConfig{ // completed jobs
+    Partitions: pqueue.PartitionConfig{ // partition pre-creation
+        ForwardWeeks: 4,
+    },
+    ColdCleanup: pqueue.PartitionCleanupConfig{ // completed jobs
         DbTimeout:         30 * time.Second,
         RetentionInterval: 7 * 24 * time.Hour,
-        CleanupBatchSize:  10_000,
     },
-    DeadCleanup: pqueue.CleanupConfig{ // failed jobs
+    DeadCleanup: pqueue.PartitionCleanupConfig{ // failed jobs
         DbTimeout:         30 * time.Second,
         RetentionInterval: 90 * 24 * time.Hour,
-        CleanupBatchSize:  10_000,
     },
 }
 
@@ -177,25 +192,64 @@ Pass `nil` as the config to use `pqueue.DefaultConfig()`.
 | `Poll.PollInterval` | `1s` |
 | `Processing.DbTimeout` | `10s` |
 | `Processing.DefaultBackoff` | `30s` |
+| `Partitions.ForwardWeeks` | `4` |
 | `ColdCleanup.RetentionInterval` | `7 days` |
 | `DeadCleanup.RetentionInterval` | `90 days` |
-| `*Cleanup.CleanupBatchSize` | `10 000` |
+| `*Cleanup.DbTimeout` | `30s` |
 
-## Cleanup
+## Partitioning
 
-Completed and failed jobs accumulate over time. Call the cleanup methods from a cron job or a periodic goroutine. Setting `RetentionInterval` to `0` or a negative value disables cleanup entirely.
+The `pqueue_jobs` table uses PostgreSQL declarative partitioning:
+
+```
+pqueue_jobs (PARTITION BY LIST (status))
+├── pqueue_jobs_hot   FOR VALUES IN ('pending', 'running')   (plain table — no sub-partitioning)
+├── pqueue_jobs_cold   FOR VALUES IN ('completed')           → PARTITION BY RANGE (created_at)
+│   ├── pqueue_jobs_cold_20260901   (week starting Sep 1)
+│   ├── pqueue_jobs_cold_20260908   (week starting Sep 8)
+│   ├── ...
+│   └── pqueue_jobs_cold_default    (catch-all safety net)
+└── pqueue_jobs_dead   FOR VALUES IN ('failed')              → PARTITION BY RANGE (created_at)
+    ├── pqueue_jobs_dead_20260901
+    ├── ...
+    └── pqueue_jobs_dead_default
+```
+
+- **Hot partition** holds `pending` and `running` jobs — the small, actively-scanned set (no sub-partitioning; jobs move in and out constantly)
+- **Cold partition** holds `completed` jobs — sub-partitioned by week, dropped once retention expires
+- **Dead partition** holds `failed` jobs — sub-partitioned by week, dropped once retention expires
+
+Weekly sub-partitions are named `pqueue_jobs_{group}_{YYYYMMDD}` where `YYYYMMDD` is the Monday of that week. PostgreSQL's partition pruning ensures queries like `WHERE status = 'pending'` only scan the hot partition, and `created_at` ranges prune to specific weekly sub-partitions in cold and dead.
+
+### Pre-creating partitions
+
+PostgreSQL does not auto-create partitions. Call `CreatePartitions` from a cron job or periodic goroutine to ensure future weekly partitions always exist:
 
 ```go
-// Remove completed jobs older than the configured retention interval
-if err := q.CleanColdJobs(ctx); err != nil {
-    log.Printf("cold job cleanup failed: %v", err)
-}
-
-// Remove failed jobs older than the configured retention interval
-if err := q.CleanDeadJobs(ctx); err != nil {
-    log.Printf("dead job cleanup failed: %v", err)
+if err := q.CreatePartitions(ctx); err != nil {
+    log.Printf("partition creation failed: %v", err)
 }
 ```
+
+This calls the `pqueue_create_weekly_partitions(forward_weeks)` SQL function, which creates weekly sub-partitions for the cold and dead groups for the current week plus `ForwardWeeks` weeks ahead.
+
+### Cleanup (partition drops)
+
+Completed and failed jobs accumulate in their respective partitions. Instead of row-by-row deletion, call the partition drop methods to instantly drop old weekly partitions via `DROP TABLE` (O(1) per partition):
+
+```go
+// Drop completed-job partitions older than the configured retention interval
+if err := q.DropOldColdPartitions(ctx); err != nil {
+    log.Printf("cold partition cleanup failed: %v", err)
+}
+
+// Drop failed-job partitions older than the configured retention interval
+if err := q.DropOldDeadPartitions(ctx); err != nil {
+    log.Printf("dead partition cleanup failed: %v", err)
+}
+```
+
+Setting `RetentionInterval` to `0` or a negative value disables cleanup entirely.
 
 ## Custom Encoder
 

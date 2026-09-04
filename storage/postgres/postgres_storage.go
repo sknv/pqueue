@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -24,10 +24,11 @@ func NewStorage(db *pgxpool.Pool) *Storage {
 	}
 }
 
+// _insertJobSQL inserts a new job
+// (fast path: plain INSERT, no idempotency check).
 const _insertJobSQL = `
 	INSERT INTO pqueue_jobs (
 	  id,
-	  idempotency_key,
 	  queue,
 	  payload,
 	  priority,
@@ -35,12 +36,17 @@ const _insertJobSQL = `
 	  stuck_timeout_millis,
 	  scheduled_at
 	)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	ON CONFLICT (idempotency_key) DO UPDATE
-	SET id = pqueue_jobs.id
-	RETURNING
+	VALUES (
+	  job_id,
+	  job_queue,
+	  job_payload,
+	  job_priority,
+	  job_max_attempts,
+	  job_stuck_timeout_millis,
+	  job_scheduled_at
+	)
+  	RETURNING
 	  id,
-	  idempotency_key,
 	  queue,
 	  payload,
 	  status,
@@ -57,23 +63,50 @@ const _insertJobSQL = `
 	  updated_at
 `
 
+// _insertIdempotentJobSQL inserts a job via pqueue_enqueue_idempotent_job,
+// which checks for an existing row by id across all partitions before inserting.
+// If a job with the same id already exists, the existing row is returned without modification.
+// Race-safe via ON CONFLICT (id, status) inside the function.
+const _insertIdempotentJobSQL = `
+	SELECT
+	  id,
+	  queue,
+	  payload,
+	  status,
+	  priority,
+	  attempts,
+	  max_attempts,
+	  stuck_timeout_millis,
+	  scheduled_at,
+	  run_at,
+	  stuck_at,
+	  completed_at,
+	  error_message,
+	  created_at,
+	  updated_at
+ 	FROM pqueue_enqueue_idempotent_job($1, $2, $3, $4, $5, $6, $7)
+`
+
 // InsertJob inserts a new job into storage.
 func (s *Storage) InsertJob(
 	ctx context.Context,
 	queryer pqueue.QueryRower,
 	id uuid.UUID,
-	idempotencyKey uuid.UUID,
 	queue string,
 	payload []byte,
 	options pqueue.JobOptions,
 ) (*pqueue.Job, error) {
+	sql := _insertJobSQL
+	if options.IsIdempotent() {
+		sql = _insertIdempotentJobSQL
+	}
+
 	var job pqueue.Job
 
 	err := queryer.QueryRow(
 		ctx,
-		_insertJobSQL,
+		sql,
 		id,
-		idempotencyKey,
 		queue,
 		payload,
 		options.Priority(),
@@ -83,7 +116,6 @@ func (s *Storage) InsertJob(
 	).
 		Scan(
 			&job.ID,
-			&job.IdempotencyKey,
 			&job.Queue,
 			&job.Payload,
 			&job.Status,
@@ -120,10 +152,14 @@ func (s *Storage) InsertBatchJobs(
 	for _, job := range jobs {
 		options := job.Options()
 
+		sql := _insertJobSQL
+		if options.IsIdempotent() {
+			sql = _insertIdempotentJobSQL
+		}
+
 		batch.Queue(
-			_insertJobSQL,
+			sql,
 			job.ID(),
-			job.IdempotencyKey(),
 			job.Queue(),
 			job.Payload(),
 			options.Priority(),
@@ -143,7 +179,6 @@ func (s *Storage) InsertBatchJobs(
 
 		err := batchResults.QueryRow().Scan(
 			&job.ID,
-			&job.IdempotencyKey,
 			&job.Queue,
 			&job.Payload,
 			&job.Status,
@@ -177,11 +212,17 @@ func (s *Storage) InsertBatchJobs(
 	return insertedJobs, nil
 }
 
+// _fetchJobsSQL atomically claims up to $3 pending or stuck-running jobs
+// across all queues using FOR NO KEY UPDATE SKIP LOCKED, transitions them to
+// running, and returns the updated rows.
+//   - $1: pending status value
+//   - $2: running status value
+//   - $3: batch size (applied to each sub-query and the final candidate set)
 const _fetchJobsSQL = `
 	WITH pre_candidates AS (
 	  (
 	    SELECT id, priority, scheduled_at
-	    FROM pqueue_jobs
+	    FROM pqueue_jobs_hot
 	    WHERE status = $1
 	      AND scheduled_at <= now()
 	    ORDER BY priority DESC, scheduled_at
@@ -190,7 +231,7 @@ const _fetchJobsSQL = `
 	  UNION ALL
 	  (
 	    SELECT id, priority, scheduled_at
-	    FROM pqueue_jobs
+	    FROM pqueue_jobs_hot
 	    WHERE status = $2
 	      AND stuck_at <= now()
 	    ORDER BY priority DESC, scheduled_at
@@ -205,7 +246,7 @@ const _fetchJobsSQL = `
 	  FOR NO KEY UPDATE SKIP LOCKED
 	)
 
-	UPDATE pqueue_jobs AS j
+	UPDATE pqueue_jobs_hot AS j
 	SET status = $2,
 	    attempts = attempts + 1,
 	    run_at = now(),
@@ -214,7 +255,6 @@ const _fetchJobsSQL = `
 	WHERE j.id = candidates.id
 	RETURNING
 	  j.id,
-	  j.idempotency_key,
 	  j.queue,
 	  j.payload,
 	  j.status,
@@ -231,11 +271,16 @@ const _fetchJobsSQL = `
 	  j.updated_at
 `
 
+// _fetchJobsWithQueuesSQL is the queue-filtered variant of _fetchJobsSQL.
+//   - $1: queue name list (text[])
+//   - $2: pending status value
+//   - $3: running status value
+//   - $4: batch size
 const _fetchJobsWithQueuesSQL = `
 	WITH pre_candidates AS (
 	  (
 	    SELECT id, priority, scheduled_at
-	    FROM pqueue_jobs
+	    FROM pqueue_jobs_hot
 	    WHERE queue = ANY($1)
 	      AND status = $2
 	      AND scheduled_at <= now()
@@ -245,7 +290,7 @@ const _fetchJobsWithQueuesSQL = `
 	  UNION ALL
 	  (
 	    SELECT id, priority, scheduled_at
-	    FROM pqueue_jobs
+	    FROM pqueue_jobs_hot
 	    WHERE queue = ANY($1)
 	      AND status = $3
 	      AND stuck_at <= now()
@@ -261,7 +306,7 @@ const _fetchJobsWithQueuesSQL = `
 	  FOR NO KEY UPDATE SKIP LOCKED
 	)
 
-	UPDATE pqueue_jobs AS j
+	UPDATE pqueue_jobs_hot AS j
 	SET status = $3,
 	    attempts = attempts + 1,
 	    run_at = now(),
@@ -270,7 +315,6 @@ const _fetchJobsWithQueuesSQL = `
 	WHERE j.id = candidates.id
 	RETURNING
 	  j.id,
-	  j.idempotency_key,
 	  j.queue,
 	  j.payload,
 	  j.status,
@@ -327,7 +371,6 @@ func (s *Storage) ListActiveJobs(ctx context.Context, queues []string, batchSize
 
 		err = rows.Scan(
 			&job.ID,
-			&job.IdempotencyKey,
 			&job.Queue,
 			&job.Payload,
 			&job.Status,
@@ -360,7 +403,7 @@ func (s *Storage) ListActiveJobs(ctx context.Context, queues []string, batchSize
 // CompleteJob marks a job in storage as completed.
 func (s *Storage) CompleteJob(ctx context.Context, id uuid.UUID) error {
 	const sql = `
-		UPDATE pqueue_jobs
+		UPDATE pqueue_jobs_hot
 		SET status = $2,
 		    completed_at = now(),
 		    error_message = NULL
@@ -387,7 +430,7 @@ func (s *Storage) ReScheduleJob(
 	errorMessage string,
 ) error {
 	const sql = `
-		UPDATE pqueue_jobs
+		UPDATE pqueue_jobs_hot
 		SET status = $2,
 		    scheduled_at = $3,
 		    error_message = $4
@@ -409,7 +452,7 @@ func (s *Storage) ReScheduleJob(
 // FailJob marks a job in storage as failed.
 func (s *Storage) FailJob(ctx context.Context, id uuid.UUID, errorMessage string) error {
 	const sql = `
-		UPDATE pqueue_jobs
+		UPDATE pqueue_jobs_hot
 		SET status = $2,
 		    completed_at = now(),
 		    error_message = $3
@@ -428,39 +471,45 @@ func (s *Storage) FailJob(ctx context.Context, id uuid.UUID, errorMessage string
 	return nil
 }
 
-// DeleteColdJobs removes completed jobs.
-func (s *Storage) DeleteColdJobs(ctx context.Context, cutoffDate time.Time, limit uint) (uint, error) {
-	return s.deleteJobs(ctx, pqueue.JobStatusCompleted, cutoffDate, limit)
-}
+// CreatePartitions pre-creates weekly sub-partitions for the current week plus
+// the specified number of forward weeks across all partition groups.
+func (s *Storage) CreatePartitions(ctx context.Context, forwardWeeks uint) error {
+	const sql = `SELECT pqueue_create_weekly_partitions($1)`
 
-// DeleteDeadJobs removes dead jobs.
-func (s *Storage) DeleteDeadJobs(ctx context.Context, cutoffDate time.Time, limit uint) (uint, error) {
-	return s.deleteJobs(ctx, pqueue.JobStatusFailed, cutoffDate, limit)
-}
-
-// deleteJobs removes jobs by status.
-func (s *Storage) deleteJobs(
-	ctx context.Context,
-	status pqueue.JobStatus,
-	cutoffDate time.Time,
-	limit uint,
-) (uint, error) {
-	const sql = `
-		DELETE FROM pqueue_jobs
-		WHERE id IN (
-		  SELECT id FROM pqueue_jobs
-		  WHERE status = $1
-		    AND created_at < $2
-		  LIMIT $3
-		)
-	`
-
-	cmd, err := s.db.Exec(ctx, sql, status, cutoffDate, limit)
-	if err != nil {
-		return 0, fmt.Errorf("exec jobs deleting query: %w", err)
+	if _, err := s.db.Exec(ctx, sql, int(forwardWeeks)); err != nil {
+		return fmt.Errorf("exec create weekly partitions query: %w", err)
 	}
 
-	rowsAffected := cmd.RowsAffected()
+	return nil
+}
 
-	return uint(rowsAffected), nil //nolint:gosec // signed i64 should always be enough
+// DropOldColdPartitions drops all completed-jobs weekly partitions whose entire
+// week precedes the cutoff date. Returns the number of dropped partitions.
+func (s *Storage) DropOldColdPartitions(ctx context.Context, cutoffDate time.Time) (uint, error) {
+	return s.dropOldPartitions(ctx, "cold", cutoffDate)
+}
+
+// DropOldDeadPartitions drops all failed-jobs weekly partitions whose entire
+// week precedes the cutoff date. Returns the number of dropped partitions.
+func (s *Storage) DropOldDeadPartitions(ctx context.Context, cutoffDate time.Time) (uint, error) {
+	return s.dropOldPartitions(ctx, "dead", cutoffDate)
+}
+
+// dropOldPartitions calls the pqueue_drop_old_partitions SQL function to drop
+// all weekly sub-partitions of the given group whose entire week precedes the
+// cutoff date. Returns the number of dropped partitions.
+func (s *Storage) dropOldPartitions(
+	ctx context.Context,
+	groupName string,
+	cutoffDate time.Time,
+) (uint, error) {
+	const sql = `SELECT pqueue_drop_old_partitions($1, $2)`
+
+	var dropped int
+
+	if err := s.db.QueryRow(ctx, sql, groupName, cutoffDate).Scan(&dropped); err != nil {
+		return 0, fmt.Errorf("exec drop old %s partitions query: %w", groupName, err)
+	}
+
+	return uint(dropped), nil //nolint:gosec // partition count will never overflow uint
 }

@@ -54,7 +54,7 @@ func main() {
 
 	// Create a queue with custom configuration
 	config := &pqueue.QueueConfig{
-		Poll: pqueue.PollConfig{
+		Polling: pqueue.PollingConfig{
 			BatchSize:    5,
 			Concurrency:  5,
 			PollInterval: time.Second * 3,
@@ -63,20 +63,26 @@ func main() {
 			DbTimeout:      time.Second * 10,
 			DefaultBackoff: time.Second * 30,
 		},
-		ColdCleanup: pqueue.CleanupConfig{
+		Partitioning: pqueue.PartitioningConfig{
+			ForwardWeeks: 4,
+		},
+		ColdCleanup: pqueue.PartitionCleanupConfig{
 			DbTimeout:         time.Second * 30,
 			RetentionInterval: time.Minute * 5,
-			CleanupBatchSize:  5,
 		},
-		DeadCleanup: pqueue.CleanupConfig{
+		DeadCleanup: pqueue.PartitionCleanupConfig{
 			DbTimeout:         time.Second * 30,
 			RetentionInterval: time.Minute * 10,
-			CleanupBatchSize:  5,
 		},
 	}
 
 	queue := pqueue.NewQueue(storage, config)
 	decoder := queue.Decoder()
+
+	// Usually you want to create partitions in some kind of cron job
+	if err = queue.CreatePartitions(ctx); err != nil {
+		log.Fatal("Failed to create partitions for job queue:", err)
+	}
 
 	// Register job handlers
 	queue.RegisterHandler("email", HandleEmailJob(decoder),
@@ -155,7 +161,7 @@ func enqueueExampleJobs(ctx context.Context, db *pgxpool.Pool, queue *pqueue.Que
 		Body:    "Welcome to our service!",
 	}
 
-	job1, err := queue.Enqueue(ctx, db, "email", uuid.Must(uuid.NewV7()), emailJob)
+	job1, err := queue.Enqueue(ctx, db, "email", emailJob)
 	if err != nil {
 		return fmt.Errorf("failed to enqueue email job: %w", err)
 	}
@@ -169,7 +175,8 @@ func enqueueExampleJobs(ctx context.Context, db *pgxpool.Pool, queue *pqueue.Que
 		Body:    "Critical system event detected",
 	}
 
-	job2, err := queue.Enqueue(ctx, db, "email", uuid.Must(uuid.NewV7()), urgentEmailJob,
+	job2, err := queue.Enqueue(ctx, db, "email", urgentEmailJob,
+		pqueue.WithJobID(uuid.Must(uuid.NewV7())),
 		pqueue.WithJobPriority(10))
 	if err != nil {
 		return fmt.Errorf("failed to enqueue urgent email job: %w", err)
@@ -187,7 +194,7 @@ func enqueueExampleJobs(ctx context.Context, db *pgxpool.Pool, queue *pqueue.Que
 
 		priority := i % 3 // Priorities 0, 1, 2
 
-		_, err := queue.Enqueue(ctx, db, "email", uuid.Must(uuid.NewV7()), batchEmailJob,
+		_, err := queue.Enqueue(ctx, db, "email", batchEmailJob,
 			pqueue.WithJobPriority(priority),
 			pqueue.WithJobMaxAttempts(3),
 			pqueue.WithJobScheduledAt(time.Now().Add(time.Duration(i)*time.Second*3)))
